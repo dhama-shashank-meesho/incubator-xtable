@@ -25,11 +25,15 @@ import static org.apache.xtable.model.storage.TableFormat.PAIMON;
 
 import java.io.IOException;
 import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Collections;
 import java.util.Map;
 
 import org.apache.hadoop.conf.Configuration;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import org.apache.xtable.conversion.CatalogConfig;
 import org.apache.xtable.utilities.RunSync.DatasetConfig;
@@ -158,9 +162,11 @@ class TestRunSync {
     Assertions.assertEquals("foo", tfConverters.get(HUDI).getConversionSourceProviderClass());
 
     Map<String, String> deltaConfigs = tfConverters.get(DELTA).getConfiguration();
-    Assertions.assertEquals(3, deltaConfigs.size());
+    Assertions.assertEquals(4, deltaConfigs.size());
     Assertions.assertEquals("local[4]", deltaConfigs.get("spark.master"));
     Assertions.assertEquals("bar", deltaConfigs.get("foo"));
+    Assertions.assertEquals(
+        "true", deltaConfigs.get("xtable.delta.source.reuse_metadata_across_commits"));
   }
 
   @Test
@@ -177,5 +183,30 @@ class TestRunSync {
     Assertions.assertEquals(2, catalogConfig.getCatalogOptions().size());
     Assertions.assertEquals("value1", catalogConfig.getCatalogOptions().get("option1"));
     Assertions.assertEquals("value2", catalogConfig.getCatalogOptions().get("option2"));
+  }
+
+  @Test
+  void sourceConfigurationEnablesDeltaMetadataReuseByDefault(@TempDir Path tempDir)
+      throws IOException {
+    DatasetConfig datasetConfig =
+        new DatasetConfig(DELTA, Collections.emptyList(), Collections.emptyList());
+    String reuseKey = "xtable.delta.source.reuse_metadata_across_commits";
+
+    Assertions.assertEquals(
+        "true", RunSync.getSourceConfiguration(null, datasetConfig).get(reuseKey));
+
+    Path converters = tempDir.resolve("converters.yaml");
+    Files.write(
+        converters,
+        ("tableFormatConverters:\n"
+                + "  DELTA:\n"
+                + "    configuration:\n"
+                + "      "
+                + reuseKey
+                + ": \"false\"\n")
+            .getBytes());
+    Assertions.assertEquals(
+        "false",
+        RunSync.getSourceConfiguration(converters.toString(), datasetConfig).get(reuseKey));
   }
 }

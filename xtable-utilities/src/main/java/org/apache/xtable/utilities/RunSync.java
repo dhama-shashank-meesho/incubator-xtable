@@ -160,7 +160,8 @@ public class RunSync {
       List<String> tableFormatList,
       CatalogConfig catalogConfig,
       Configuration hadoopConf,
-      ConversionSourceProvider conversionSourceProvider) {
+      ConversionSourceProvider conversionSourceProvider,
+      Map<String, String> sourceConfiguration) {
     ConversionController conversionController = new ConversionController(hadoopConf);
     for (DatasetConfig.Table table : datasetConfig.getDatasets()) {
       log.info(
@@ -168,6 +169,16 @@ public class RunSync {
           table.getTableBasePath(),
           tableFormatList);
       Properties sourceProperties = new Properties();
+      if (sourceConfiguration != null) {
+        sourceProperties.putAll(sourceConfiguration);
+        log.info(
+            "Source properties for {}: {}",
+            table.getTableBasePath(),
+            sourceConfiguration.entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith("xtable."))
+                .map(entry -> entry.getKey() + "=" + entry.getValue())
+                .collect(Collectors.joining(", ")));
+      }
       if (table.getPartitionSpec() != null) {
         sourceProperties.put(
             HudiSourceConfig.PARTITION_FIELD_SPEC_CONFIG, table.getPartitionSpec());
@@ -233,6 +244,20 @@ public class RunSync {
     return conversionSourceProvider;
   }
 
+  /**
+   * Returns the {@code configuration} block of the source format in the converters config, which is
+   * passed to the conversion source as table properties (e.g. {@link
+   * org.apache.xtable.delta.DeltaConversionSourceConfig#REUSE_METADATA_ACROSS_COMMITS}).
+   */
+  static Map<String, String> getSourceConfiguration(
+      String conversionProviderConfigpath, DatasetConfig datasetConfig) throws IOException {
+    TableFormatConverters.ConversionConfig sourceConversionConfig =
+        loadTableFormatConversionConfigs(getCustomConfigurations(conversionProviderConfigpath))
+            .getTableFormatConverters()
+            .get(datasetConfig.sourceFormat);
+    return sourceConversionConfig == null ? null : sourceConversionConfig.getConfiguration();
+  }
+
   static String getValueFromConfig(CommandLine cmd, String configFlag) {
     return cmd.getOptionValue(configFlag);
   }
@@ -295,7 +320,12 @@ public class RunSync {
         getConversionSourceProvider(conversionProviderConfigpath, datasetConfig, hadoopConf);
     List<String> tableFormatList = datasetConfig.getTargetFormats();
     syncTableMetdata(
-        datasetConfig, tableFormatList, catalogConfig, hadoopConf, conversionSourceProvider);
+        datasetConfig,
+        tableFormatList,
+        catalogConfig,
+        hadoopConf,
+        conversionSourceProvider,
+        getSourceConfiguration(conversionProviderConfigpath, datasetConfig));
   }
 
   static byte[] getCustomConfigurations(String Configpath) throws IOException {
