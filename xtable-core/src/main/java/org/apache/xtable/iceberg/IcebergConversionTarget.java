@@ -32,6 +32,7 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 
+import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
@@ -279,6 +280,7 @@ public class IcebergConversionTarget implements ConversionTarget {
   @Override
   public void syncFilesForDiff(InternalFilesDiff internalFilesDiff) {
     dataFileUpdatesExtractor.applyDiff(
+        table,
         transaction,
         internalFilesDiff,
         transaction.table().schema(),
@@ -352,30 +354,76 @@ public class IcebergConversionTarget implements ConversionTarget {
       // there is no existing table so exit early
       return;
     }
-    // There are cases when using the HadoopTables API where the table metadata json is updated but
-    // the manifest file is not written, causing corruption. This is a workaround to fix the issue.
-    if (catalogConfig == null && table.currentSnapshot() != null) {
-      boolean validSnapshot = false;
-      while (!validSnapshot) {
-        try {
-          table.currentSnapshot().allManifests(table.io());
-          validSnapshot = true;
-        } catch (NotFoundException ex) {
-          Snapshot currentSnapshot = table.currentSnapshot();
-          log.warn(
-              "Corrupt snapshot detected for table: {} snapshotId: {}. Rolling back to previous snapshot: {}.",
-              tableIdentifier,
-              currentSnapshot.snapshotId(),
-              currentSnapshot.parentId());
-          // if we need to rollback, we must also clear the last sync state since that sync is no
-          // longer considered valid. This will force InternalTable to fall back to a snapshot sync
-          // in the subsequent sync round.
-          table.manageSnapshots().rollbackTo(currentSnapshot.parentId()).commit();
-          Transaction transaction = table.newTransaction();
-          transaction.updateProperties().remove(TableSyncMetadata.XTABLE_METADATA).commit();
-          transaction.commitTransaction();
-        }
+    if (table.currentSnapshot() == null) {
+      return;
+    }
+    // Walk back from the current snapshot until we find one whose manifest list and every leaf
+    // manifest are readable. Two failure modes are handled:
+    //   1. HadoopTables corruption — metadata.json is updated but the manifest list isn't written.
+    //   2. External deletion of leaf manifest .avro files (e.g., GCS bucket lifecycle deleting
+    //      noncurrent generations after N days). Iceberg pins object generations in the manifest
+    //      list, so a lifecycle-deleted noncurrent generation produces a NotFoundException with
+    //      "the live version is still available but the requested generation is deleted".
+    // Mode (1) only manifests on HadoopTables (no catalog); mode (2) applies to any catalog.
+    while (true) {
+      Snapshot currentSnapshot = table.currentSnapshot();
+      if (currentSnapshot == null) {
+        return;
+      }
+      String corruptionReason = detectSnapshotCorruption(currentSnapshot);
+      if (corruptionReason == null) {
+        return;
+      }
+      Long parentId = currentSnapshot.parentId();
+      if (parentId == null) {
+        log.warn(
+            "Corrupt root snapshot detected for table: {} snapshotId: {} ({}); cannot roll back further. "
+                + "The next sync will treat the existing file set as empty and rewrite manifests.",
+            tableIdentifier,
+            currentSnapshot.snapshotId(),
+            corruptionReason);
+        return;
+      }
+      log.warn(
+          "Corrupt snapshot detected for table: {} snapshotId: {} ({}). Rolling back to previous snapshot: {}.",
+          tableIdentifier,
+          currentSnapshot.snapshotId(),
+          corruptionReason,
+          parentId);
+      // Clear the last sync state alongside the rollback so the next sync round falls back to a
+      // full snapshot sync instead of trying an incremental diff against a stale identifier.
+      table.manageSnapshots().rollbackTo(parentId).commit();
+      Transaction rollbackTxn = table.newTransaction();
+      rollbackTxn.updateProperties().remove(TableSyncMetadata.XTABLE_METADATA).commit();
+      rollbackTxn.commitTransaction();
+    }
+  }
+
+  /**
+   * Returns a non-null short description if the snapshot is unreadable, or {@code null} if it's
+   * fully valid. Checks manifest-list readability (HadoopTables-only corruption) and leaf-manifest
+   * existence (applies to any catalog when external deletion has occurred).
+   */
+  private String detectSnapshotCorruption(Snapshot snapshot) {
+    List<ManifestFile> manifests;
+    try {
+      manifests = snapshot.allManifests(table.io());
+    } catch (NotFoundException ex) {
+      // Manifest list itself is missing — this is the HadoopTables-only failure mode the original
+      // guard was written for.
+      if (catalogConfig != null) {
+        // Don't treat as corrupt for catalog-managed tables: the catalog should be the source of
+        // truth, and a missing manifest list there indicates a different problem we shouldn't
+        // silently rewrite around.
+        throw ex;
+      }
+      return "manifest list missing: " + ex.getMessage();
+    }
+    for (ManifestFile manifest : manifests) {
+      if (!table.io().newInputFile(manifest.path()).exists()) {
+        return "leaf manifest missing: " + manifest.path();
       }
     }
+    return null;
   }
 }

@@ -24,6 +24,9 @@ import java.util.Set;
 import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
 
+import org.apache.commons.lang3.StringUtils;
+import org.apache.hadoop.conf.Configuration;
+
 import org.apache.spark.sql.delta.actions.AddFile;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -38,6 +41,9 @@ import org.apache.xtable.model.stat.FileStats;
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
 public class DeltaStatsExtractor {
   private static final DeltaStatsExtractor INSTANCE = new DeltaStatsExtractor();
+
+  private final DeltaParquetFooterStatsReader footerStatsReader =
+      new DeltaParquetFooterStatsReader(new Configuration());
 
   public static DeltaStatsExtractor getInstance() {
     return INSTANCE;
@@ -67,6 +73,23 @@ public class DeltaStatsExtractor {
    */
   public FileStats getColumnStatsForFile(AddFile addFile, List<InternalField> fields) {
     return DeltaStatsUtils.parseColumnStatsFromJson(addFile.stats(), fields);
+  }
+
+  /**
+   * Extracts column statistics from Delta AddFile, falling back to the Parquet footer of the data
+   * file when the AddFile carries no stats.
+   *
+   * @param addFile the Delta AddFile action
+   * @param fullPath the absolute path to the data file
+   * @param fields the fields to extract stats for
+   * @return FileStats containing column statistics
+   */
+  public FileStats getColumnStatsForFile(
+      AddFile addFile, String fullPath, List<InternalField> fields) {
+    if (StringUtils.isNotEmpty(addFile.stats())) {
+      return getColumnStatsForFile(addFile, fields);
+    }
+    return footerStatsReader.readStats(fullPath, fields);
   }
 
   /**

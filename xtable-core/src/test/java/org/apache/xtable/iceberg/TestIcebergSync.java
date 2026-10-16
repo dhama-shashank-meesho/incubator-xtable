@@ -364,6 +364,70 @@ public class TestIcebergSync {
     assertEquals(snapshotIdBeforeCorruption, table.currentSnapshot().parentId());
   }
 
+  /**
+   * Reproduces the production failure mode where a leaf manifest .avro is deleted from object
+   * storage (e.g., GCS bucket lifecycle removing the noncurrent generation after N days) but the
+   * manifest list still references it. The original {@code rollbackCorruptCommits} only probed the
+   * manifest list itself and would let execution proceed into {@code planFiles()}, which then
+   * failed with NotFoundException. Verifies the extended check rolls back to the previous snapshot
+   * and the next sync succeeds.
+   */
+  @Test
+  public void testLeafManifestMissingRollback() throws Exception {
+    InternalTable table1 =
+        getInternalTable(tableName, basePath, internalSchema, null, LAST_COMMIT_TIME);
+    InternalTable table2 =
+        getInternalTable(
+            tableName, basePath, internalSchema, null, LAST_COMMIT_TIME.plusMillis(100000L));
+
+    InternalDataFile dataFile1 = getDataFile(1, Collections.emptyList());
+    InternalDataFile dataFile2 = getDataFile(2, Collections.emptyList());
+    InternalDataFile dataFile3 = getDataFile(3, Collections.emptyList());
+    InternalDataFile dataFile4 = getDataFile(4, Collections.emptyList());
+    InternalSnapshot snapshot1 = buildSnapshot(table1, "0", dataFile1, dataFile2);
+    InternalSnapshot snapshot2 = buildSnapshot(table2, "1", dataFile2, dataFile3);
+    InternalSnapshot snapshot3 = buildSnapshot(table2, "2", dataFile3, dataFile4);
+    when(mockSchemaExtractor.toIceberg(internalSchema)).thenReturn(icebergSchema);
+    ArgumentCaptor<Schema> partitionSpecSchemaArgumentCaptor =
+        ArgumentCaptor.forClass(Schema.class);
+    when(mockPartitionSpecExtractor.toIceberg(
+            eq(null), partitionSpecSchemaArgumentCaptor.capture()))
+        .thenReturn(PartitionSpec.unpartitioned())
+        .thenReturn(PartitionSpec.unpartitioned())
+        .thenReturn(PartitionSpec.unpartitioned());
+    mockColStatsForFile(dataFile1, 2);
+    mockColStatsForFile(dataFile2, 2);
+    mockColStatsForFile(dataFile3, 2);
+    mockColStatsForFile(dataFile4, 1);
+
+    TableFormatSync.getInstance()
+        .syncSnapshot(Collections.singletonList(conversionTarget), snapshot1);
+    long snapshotIdBeforeCorruption = getTable(basePath).currentSnapshot().snapshotId();
+    TableFormatSync.getInstance()
+        .syncSnapshot(Collections.singletonList(conversionTarget), snapshot2);
+
+    // Delete one of the leaf manifests of the current snapshot to simulate lifecycle deletion.
+    Table tableAfterSnapshot2 = new HadoopTables(CONFIGURATION).load(basePath.toString());
+    String victimManifest =
+        tableAfterSnapshot2.currentSnapshot().allManifests(tableAfterSnapshot2.io()).get(0).path();
+    Files.delete(Paths.get(URI.create(victimManifest)));
+
+    // The next sync should detect the corruption during init() (rollbackCorruptCommits), roll
+    // back to the snapshot before snapshot2, and clear the XTable metadata so the next sync round
+    // performs a full snapshot sync.
+    Optional<Instant> actual =
+        getConversionTarget().getTableMetadata().map(TableSyncMetadata::getLastInstantSynced);
+    assertFalse(actual.isPresent());
+
+    TableFormatSync.getInstance()
+        .syncSnapshot(Collections.singletonList(conversionTarget), snapshot3);
+    validateIcebergTable(
+        tableName, table2, Sets.newHashSet(dataFile3, dataFile4), null, icebergSchema);
+    Table table = getTable(basePath);
+    assertEquals(4, table.history().size());
+    assertEquals(snapshotIdBeforeCorruption, table.currentSnapshot().parentId());
+  }
+
   @Test
   public void testTimestampPartitioning() throws Exception {
     // test partition filtering

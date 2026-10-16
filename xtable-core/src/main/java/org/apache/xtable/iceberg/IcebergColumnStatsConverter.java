@@ -67,13 +67,14 @@ public class IcebergColumnStatsConverter {
           valueCounts.put(fieldId, columnStats.getNumValues());
           nullValueCounts.put(fieldId, columnStats.getNumNulls());
           Type fieldType = icebergField.type();
-          if (columnStats.getRange().getMinValue() != null) {
-            lowerBounds.put(
-                fieldId, Conversions.toByteBuffer(fieldType, columnStats.getRange().getMinValue()));
+          // Add min/max bounds if available (they're optional in Iceberg Metrics)
+          // Native Iceberg includes columns even without bounds - they just have null bounds
+          Range range = columnStats.getRange();
+          if (range != null && range.getMinValue() != null) {
+            lowerBounds.put(fieldId, Conversions.toByteBuffer(fieldType, range.getMinValue()));
           }
-          if (columnStats.getRange().getMaxValue() != null) {
-            upperBounds.put(
-                fieldId, Conversions.toByteBuffer(fieldType, columnStats.getRange().getMaxValue()));
+          if (range != null && range.getMaxValue() != null) {
+            upperBounds.put(fieldId, Conversions.toByteBuffer(fieldType, range.getMaxValue()));
           }
         });
     return new Metrics(

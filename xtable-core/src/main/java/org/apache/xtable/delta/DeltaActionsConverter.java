@@ -75,12 +75,13 @@ public class DeltaActionsConverter {
       boolean includeColumnStats,
       DeltaPartitionExtractor partitionExtractor,
       DeltaStatsExtractor fileStatsExtractor) {
-    FileStats fileStats = fileStatsExtractor.getColumnStatsForFile(addFile, fields);
+    String fullPath = DeltaPathUtils.getFullPathToFile(tableBasePath, addFile.path());
+    FileStats fileStats = fileStatsExtractor.getColumnStatsForFile(addFile, fullPath, fields);
     List<ColumnStat> columnStats =
         includeColumnStats ? fileStats.getColumnStats() : Collections.emptyList();
     long recordCount = fileStats.getNumRecords();
     return InternalDataFile.builder()
-        .physicalPath(DeltaPathUtils.getFullPathToFile(tableBasePath, addFile.path()))
+        .physicalPath(fullPath)
         .fileFormat(fileFormat)
         .fileSizeBytes(addFile.size())
         .lastModified(addFile.modificationTime())
