@@ -69,18 +69,16 @@ public class DeltaDataFileExtractor {
           partitionExtractor.convertFromDeltaPartitionFormat(
               schema, snapshot.metadata().partitionSchema());
       this.dataFilesIterator =
-          snapshot.allFiles().collectAsList().stream()
-              .map(
-                  addFile ->
-                      actionsConverter.convertAddActionToInternalDataFile(
-                          addFile,
-                          snapshot,
-                          fileFormat,
-                          partitionFields,
-                          fields,
-                          includeColumnStats,
-                          partitionExtractor,
-                          fileStatsExtractor))
+          actionsConverter
+              .convertAddActionsToInternalDataFiles(
+                  snapshot.allFiles().collectAsList(),
+                  snapshot,
+                  fileFormat,
+                  partitionFields,
+                  fields,
+                  includeColumnStats,
+                  partitionExtractor,
+                  fileStatsExtractor)
               .iterator();
     }
 

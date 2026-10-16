@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
@@ -426,6 +427,36 @@ public class TestIcebergSync {
     Table table = getTable(basePath);
     assertEquals(4, table.history().size());
     assertEquals(snapshotIdBeforeCorruption, table.currentSnapshot().parentId());
+  }
+
+  /**
+   * When the only snapshot is unreadable there is nothing to roll back to. Syncing on top of it
+   * would carry the missing manifest forward, so initialization must fail instead.
+   */
+  @Test
+  public void testUnrecoverableManifestLossFails() throws Exception {
+    InternalTable table1 =
+        getInternalTable(tableName, basePath, internalSchema, null, LAST_COMMIT_TIME);
+    InternalDataFile dataFile1 = getDataFile(1, Collections.emptyList());
+    InternalDataFile dataFile2 = getDataFile(2, Collections.emptyList());
+    InternalSnapshot snapshot1 = buildSnapshot(table1, "0", dataFile1, dataFile2);
+    when(mockSchemaExtractor.toIceberg(internalSchema)).thenReturn(icebergSchema);
+    when(mockPartitionSpecExtractor.toIceberg(eq(null), any()))
+        .thenReturn(PartitionSpec.unpartitioned());
+    mockColStatsForFile(dataFile1, 1);
+    mockColStatsForFile(dataFile2, 1);
+    TableFormatSync.getInstance()
+        .syncSnapshot(Collections.singletonList(conversionTarget), snapshot1);
+
+    Table table = new HadoopTables(CONFIGURATION).load(basePath.toString());
+    long snapshotId = table.currentSnapshot().snapshotId();
+    String manifest = table.currentSnapshot().allManifests(table.io()).get(0).path();
+    Files.delete(Paths.get(URI.create(manifest)));
+
+    IllegalStateException e =
+        assertThrows(IllegalStateException.class, () -> getConversionTarget().getTableMetadata());
+    assertTrue(e.getMessage().contains("no earlier snapshot to roll back to"));
+    assertEquals(snapshotId, getTable(basePath).currentSnapshot().snapshotId());
   }
 
   @Test

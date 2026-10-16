@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import lombok.Builder;
 import lombok.extern.log4j.Log4j2;
@@ -141,25 +142,32 @@ public class DeltaConversionSource implements ConversionSource<Long> {
     // Set of data file paths for which deletion vectors exists.
     Set<String> deletionVectors = new HashSet<>();
 
+    List<AddFile> addActions =
+        actionsForVersion.stream()
+            .filter(AddFile.class::isInstance)
+            .map(AddFile.class::cast)
+            .collect(Collectors.toList());
+    List<InternalDataFile> addedDataFiles =
+        actionsConverter.convertAddActionsToInternalDataFiles(
+            addActions,
+            tableBasePath,
+            fileFormat,
+            tableAtVersion.getPartitioningFields(),
+            tableAtVersion.getReadSchema().getAllFields(),
+            true,
+            DeltaPartitionExtractor.getInstance(),
+            DeltaStatsExtractor.getInstance());
+    for (int i = 0; i < addActions.size(); i++) {
+      InternalDataFile dataFile = addedDataFiles.get(i);
+      addedFiles.put(dataFile.getPhysicalPath(), dataFile);
+      String deleteVectorPath =
+          actionsConverter.extractDeletionVectorFile(tableBasePath, addActions.get(i));
+      if (deleteVectorPath != null) {
+        deletionVectors.add(deleteVectorPath);
+      }
+    }
     for (Action action : actionsForVersion) {
-      if (action instanceof AddFile) {
-        InternalDataFile dataFile =
-            actionsConverter.convertAddActionToInternalDataFile(
-                (AddFile) action,
-                tableBasePath,
-                fileFormat,
-                tableAtVersion.getPartitioningFields(),
-                tableAtVersion.getReadSchema().getAllFields(),
-                true,
-                DeltaPartitionExtractor.getInstance(),
-                DeltaStatsExtractor.getInstance());
-        addedFiles.put(dataFile.getPhysicalPath(), dataFile);
-        String deleteVectorPath =
-            actionsConverter.extractDeletionVectorFile(tableBasePath, (AddFile) action);
-        if (deleteVectorPath != null) {
-          deletionVectors.add(deleteVectorPath);
-        }
-      } else if (action instanceof RemoveFile) {
+      if (action instanceof RemoveFile) {
         InternalDataFile dataFile =
             actionsConverter.convertRemoveActionToInternalDataFile(
                 (RemoveFile) action,

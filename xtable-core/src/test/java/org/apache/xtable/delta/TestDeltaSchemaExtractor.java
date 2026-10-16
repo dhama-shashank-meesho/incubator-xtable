@@ -1179,6 +1179,45 @@ public class TestDeltaSchemaExtractor {
   }
 
   @Test
+  public void testByteTypeConversion() {
+    InternalSchema internalSchema =
+        InternalSchema.builder()
+            .name("struct")
+            .dataType(InternalType.RECORD)
+            .isNullable(false)
+            .fields(
+                Arrays.asList(
+                    InternalField.builder()
+                        .name("requiredByte")
+                        .schema(
+                            InternalSchema.builder()
+                                .name("byte")
+                                .dataType(InternalType.INT)
+                                .isNullable(false)
+                                .build())
+                        .build(),
+                    InternalField.builder()
+                        .name("optionalByte")
+                        .schema(
+                            InternalSchema.builder()
+                                .name("byte")
+                                .dataType(InternalType.INT)
+                                .isNullable(true)
+                                .build())
+                        .defaultValue(InternalField.Constants.NULL_DEFAULT_VALUE)
+                        .build()))
+            .build();
+
+    StructType structRepresentation =
+        new StructType()
+            .add("requiredByte", DataTypes.ByteType, false)
+            .add("optionalByte", DataTypes.ByteType, true);
+
+    Assertions.assertEquals(
+        internalSchema, DeltaSchemaExtractor.getInstance().toInternalSchema(structRepresentation));
+  }
+
+  @Test
   public void testShortTypeConversion() {
     InternalSchema internalSchema =
         InternalSchema.builder()

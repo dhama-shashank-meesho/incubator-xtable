@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import lombok.extern.log4j.Log4j2;
 
@@ -48,6 +49,8 @@ import org.apache.iceberg.mapping.MappedFields;
 import org.apache.iceberg.mapping.MappingUtil;
 import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
+import org.apache.iceberg.util.Tasks;
+import org.apache.iceberg.util.ThreadPools;
 
 import org.apache.xtable.conversion.TargetTable;
 import org.apache.xtable.model.InternalTable;
@@ -280,7 +283,6 @@ public class IcebergConversionTarget implements ConversionTarget {
   @Override
   public void syncFilesForDiff(InternalFilesDiff internalFilesDiff) {
     dataFileUpdatesExtractor.applyDiff(
-        table,
         transaction,
         internalFilesDiff,
         transaction.table().schema(),
@@ -357,14 +359,12 @@ public class IcebergConversionTarget implements ConversionTarget {
     if (table.currentSnapshot() == null) {
       return;
     }
-    // Walk back from the current snapshot until we find one whose manifest list and every leaf
+    // Walk back from the current snapshot until we find one whose manifest list and every
     // manifest are readable. Two failure modes are handled:
-    //   1. HadoopTables corruption — metadata.json is updated but the manifest list isn't written.
-    //   2. External deletion of leaf manifest .avro files (e.g., GCS bucket lifecycle deleting
-    //      noncurrent generations after N days). Iceberg pins object generations in the manifest
-    //      list, so a lifecycle-deleted noncurrent generation produces a NotFoundException with
-    //      "the live version is still available but the requested generation is deleted".
-    // Mode (1) only manifests on HadoopTables (no catalog); mode (2) applies to any catalog.
+    //   1. HadoopTables corruption: metadata.json is updated but the manifest list isn't written.
+    //   2. Manifests deleted from storage while still referenced, e.g. by snapshot expiry in a
+    //      concurrent sync of the same table, or by a bucket lifecycle rule.
+    // Mode (1) only applies to HadoopTables (no catalog); mode (2) applies to any catalog.
     while (true) {
       Snapshot currentSnapshot = table.currentSnapshot();
       if (currentSnapshot == null) {
@@ -375,17 +375,19 @@ public class IcebergConversionTarget implements ConversionTarget {
         return;
       }
       Long parentId = currentSnapshot.parentId();
-      if (parentId == null) {
-        log.warn(
-            "Corrupt root snapshot detected for table: {} snapshotId: {} ({}); cannot roll back further. "
-                + "The next sync will treat the existing file set as empty and rewrite manifests.",
-            tableIdentifier,
-            currentSnapshot.snapshotId(),
-            corruptionReason);
-        return;
+      if (parentId == null || table.snapshot(parentId) == null) {
+        // Committing on top of this snapshot would carry the unreadable manifests forward, so fail
+        // instead of producing a table that reports success but cannot be read.
+        throw new IllegalStateException(
+            String.format(
+                "Iceberg table %s is unreadable at snapshot %d (%s) and has no earlier snapshot to"
+                    + " roll back to. Delete the table's Iceberg metadata directory and resync to"
+                    + " rebuild it from the source.",
+                tableIdentifier, currentSnapshot.snapshotId(), corruptionReason));
       }
       log.warn(
-          "Corrupt snapshot detected for table: {} snapshotId: {} ({}). Rolling back to previous snapshot: {}.",
+          "Corrupt snapshot detected for table: {} snapshotId: {} ({}). Rolling back to previous"
+              + " snapshot: {}; the next sync will be a full snapshot sync.",
           tableIdentifier,
           currentSnapshot.snapshotId(),
           corruptionReason,
@@ -419,11 +421,19 @@ public class IcebergConversionTarget implements ConversionTarget {
       }
       return "manifest list missing: " + ex.getMessage();
     }
-    for (ManifestFile manifest : manifests) {
-      if (!table.io().newInputFile(manifest.path()).exists()) {
-        return "leaf manifest missing: " + manifest.path();
-      }
-    }
-    return null;
+    Set<String> missingManifests = ConcurrentHashMap.newKeySet();
+    Tasks.foreach(manifests)
+        .executeWith(ThreadPools.getWorkerPool())
+        .run(
+            manifest -> {
+              if (!table.io().newInputFile(manifest.path()).exists()) {
+                missingManifests.add(manifest.path());
+              }
+            });
+    return missingManifests.isEmpty()
+        ? null
+        : missingManifests.size()
+            + " manifest(s) missing, e.g. "
+            + missingManifests.iterator().next();
   }
 }

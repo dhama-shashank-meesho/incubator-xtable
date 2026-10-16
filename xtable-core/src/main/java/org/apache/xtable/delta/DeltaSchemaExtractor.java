@@ -119,6 +119,7 @@ public class DeltaSchemaExtractor {
     int openParenIndex = typeName.indexOf("(");
     String trimmedTypeName = openParenIndex > 0 ? typeName.substring(0, openParenIndex) : typeName;
     switch (trimmedTypeName) {
+      case "byte":
       case "short":
         type = InternalType.INT;
         break;
