@@ -56,16 +56,33 @@ import org.apache.xtable.parquet.ParquetMetadataExtractor;
  * non-micros timestamps) is skipped rather than risk writing wrong bounds to the target. A failure
  * to read stats never fails the sync; the record count is preserved whenever the footer is
  * readable.
+ *
+ * <p>Column stats are kept for at most the first {@code xtable.delta.footerStatsMaxColumns}
+ * (default 100, Iceberg's default for inferred metrics) leaf columns of the file in schema order;
+ * -1 keeps all. On wide tables stats for every column dominate memory during a sync and bloat the
+ * target's manifests, while query engines rarely prune on columns that far into the schema.
  */
 @Log4j2
 class DeltaParquetFooterStatsReader {
+  static final String MAX_COLUMNS_PROPERTY = "xtable.delta.footerStatsMaxColumns";
+  private static final int DEFAULT_MAX_COLUMNS = 100;
   private static final ParquetMetadataExtractor PARQUET_METADATA_EXTRACTOR =
       ParquetMetadataExtractor.getInstance();
 
   private final Configuration conf;
+  private final int maxColumns;
 
   DeltaParquetFooterStatsReader(Configuration conf) {
+    this(conf, Integer.getInteger(MAX_COLUMNS_PROPERTY, DEFAULT_MAX_COLUMNS));
+    log.info(
+        "Column stats read from Parquet footers are limited to the first {} columns ({})",
+        maxColumns < 0 ? "all" : maxColumns,
+        MAX_COLUMNS_PROPERTY);
+  }
+
+  DeltaParquetFooterStatsReader(Configuration conf, int maxColumns) {
     this.conf = conf;
+    this.maxColumns = maxColumns;
   }
 
   FileStats readStats(String fullPath, List<InternalField> fields) {
@@ -93,14 +110,14 @@ class DeltaParquetFooterStatsReader {
     return FileStats.builder().columnStats(columnStats).numRecords(numRecords).build();
   }
 
-  private static List<ColumnStat> getColumnStats(
-      ParquetMetadata footer, List<InternalField> fields) {
+  private List<ColumnStat> getColumnStats(ParquetMetadata footer, List<InternalField> fields) {
     Map<String, List<ColumnChunkMetaData>> chunksByPath =
         footer.getBlocks().stream()
             .flatMap(block -> block.getColumns().stream())
             .collect(Collectors.groupingBy(chunk -> chunk.getPath().toDotString()));
     Map<String, String> physicalPathByLogicalPath = getPhysicalPaths(fields);
     List<ColumnStat> columnStats = new ArrayList<>();
+    int columnsSeen = 0;
     for (InternalField field : fields) {
       if (field.getSchema().getFields() != null) {
         continue;
@@ -108,8 +125,13 @@ class DeltaParquetFooterStatsReader {
       List<ColumnChunkMetaData> chunks =
           chunksByPath.get(physicalPathByLogicalPath.get(field.getPath()));
       if (chunks == null || chunks.isEmpty()) {
+        // not stored in the file (e.g. a partition column), so it does not count toward the limit
         continue;
       }
+      if (maxColumns >= 0 && columnsSeen >= maxColumns) {
+        break;
+      }
+      columnsSeen++;
       ColumnStat stat = mergeChunks(field, chunks);
       if (stat != null) {
         columnStats.add(stat);

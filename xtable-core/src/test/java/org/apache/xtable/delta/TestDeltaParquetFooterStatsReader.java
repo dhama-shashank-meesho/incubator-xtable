@@ -24,6 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.math.BigDecimal;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -120,6 +121,49 @@ public class TestDeltaParquetFooterStatsReader {
         statsByPath.get("price").getRange());
     assertEquals(Range.vector(3, 7), statsByPath.get("s.x").getRange());
     assertEquals(4, statsByPath.size(), "INT96 and struct fields should have no stats");
+  }
+
+  @Test
+  void limitsColumnStatsToFirstColumnsInFile() throws Exception {
+    MessageType parquetSchema =
+        Types.buildMessage()
+            .required(PrimitiveTypeName.INT64)
+            .named("a")
+            .required(PrimitiveTypeName.INT64)
+            .named("b")
+            .required(PrimitiveTypeName.INT64)
+            .named("c")
+            .named("record");
+    String path = tempDir.resolve("wide.parquet").toString();
+    try (ParquetWriter<Group> writer =
+        ExampleParquetWriter.builder(new Path(path)).withType(parquetSchema).build()) {
+      SimpleGroupFactory groups = new SimpleGroupFactory(parquetSchema);
+      writer.write(groups.newGroup().append("a", 1L).append("b", 2L).append("c", 3L));
+      writer.write(groups.newGroup().append("a", 4L).append("b", 5L).append("c", 6L));
+    }
+    // the partition column is not stored in the file, so it must not use up the limit
+    List<InternalField> fields =
+        Arrays.asList(
+            field("dt", null, InternalType.DATE, null),
+            field("a", null, InternalType.LONG, null),
+            field("b", null, InternalType.LONG, null),
+            field("c", null, InternalType.LONG, null));
+    Configuration conf = new Configuration();
+
+    FileStats limited = new DeltaParquetFooterStatsReader(conf, 2).readStats(path, fields);
+    assertEquals(2, limited.getNumRecords());
+    assertEquals(
+        Arrays.asList("a", "b"),
+        limited.getColumnStats().stream()
+            .map(stat -> stat.getField().getPath())
+            .collect(Collectors.toList()));
+
+    FileStats countOnly = new DeltaParquetFooterStatsReader(conf, 0).readStats(path, fields);
+    assertEquals(2, countOnly.getNumRecords());
+    assertTrue(countOnly.getColumnStats().isEmpty());
+
+    FileStats unlimited = new DeltaParquetFooterStatsReader(conf, -1).readStats(path, fields);
+    assertEquals(3, unlimited.getColumnStats().size());
   }
 
   @Test
