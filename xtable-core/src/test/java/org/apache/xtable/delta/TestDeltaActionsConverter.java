@@ -137,6 +137,47 @@ class TestDeltaActionsConverter {
                     statsExtractor));
   }
 
+  @Test
+  void convertAddActionsLogsProgressWithoutChangingResults() {
+    DeltaStatsExtractor statsExtractor = Mockito.mock(DeltaStatsExtractor.class);
+    Mockito.when(statsExtractor.getColumnStatsForFile(any(), anyString(), any()))
+        .thenAnswer(
+            invocation -> {
+              Thread.sleep(5);
+              String path = invocation.getArgument(1);
+              long records = Long.parseLong(path.substring(path.lastIndexOf('-') + 1));
+              return FileStats.builder()
+                  .columnStats(Collections.emptyList())
+                  .numRecords(records)
+                  .build();
+            });
+    // even files carry Delta stats; odd ones would be read from the Parquet footer
+    List<AddFile> addFiles =
+        IntStream.range(0, 50)
+            .mapToObj(
+                i ->
+                    new AddFile(
+                        "file-" + i, null, 10, 1L, true, i % 2 == 0 ? "{}" : "", null, null))
+            .collect(Collectors.toList());
+    // interval 0 logs progress on every wait, exercising the progress path
+    List<InternalDataFile> dataFiles =
+        DeltaActionsConverter.getInstance()
+            .convertAddActionsToInternalDataFiles(
+                addFiles,
+                "gs://bucket/table",
+                FileFormat.APACHE_PARQUET,
+                Collections.emptyList(),
+                Collections.emptyList(),
+                true,
+                partitionExtractor(),
+                statsExtractor,
+                0);
+    Assertions.assertEquals(50, dataFiles.size());
+    for (int i = 0; i < 50; i++) {
+      Assertions.assertEquals(i, dataFiles.get(i).getRecordCount());
+    }
+  }
+
   private static DeltaPartitionExtractor partitionExtractor() {
     DeltaPartitionExtractor partitionExtractor = Mockito.mock(DeltaPartitionExtractor.class);
     Mockito.when(partitionExtractor.partitionValueExtraction(any(), any()))

@@ -22,10 +22,12 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.stream.Collectors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 
 import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
@@ -38,9 +40,11 @@ import org.apache.spark.sql.delta.actions.AddFile;
 import org.apache.spark.sql.delta.actions.DeletionVectorDescriptor;
 import org.apache.spark.sql.delta.actions.RemoveFile;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 import org.apache.xtable.exception.NotSupportedException;
+import org.apache.xtable.exception.ReadException;
 import org.apache.xtable.model.schema.InternalField;
 import org.apache.xtable.model.schema.InternalPartitionField;
 import org.apache.xtable.model.stat.ColumnStat;
@@ -62,6 +66,9 @@ public class DeltaActionsConverter {
               .setDaemon(true)
               .setNameFormat("delta-add-file-converter-%d")
               .build());
+  // A batch that is still running after this long logs its progress, and again at this interval.
+  private static final String PROGRESS_LOG_INTERVAL_SECONDS =
+      "xtable.delta.statsProgressLogIntervalSeconds";
 
   private static final DeltaActionsConverter INSTANCE = new DeltaActionsConverter();
 
@@ -138,6 +145,10 @@ public class DeltaActionsConverter {
   /**
    * Converts the AddFile actions concurrently, preserving their order. Equivalent to calling {@link
    * #convertAddActionToInternalDataFile} for each one.
+   *
+   * <p>Files without Delta stats have their Parquet footer read, which dominates the time on large
+   * tables, so a batch running longer than {@code xtable.delta.statsProgressLogIntervalSeconds}
+   * logs its progress periodically and a summary at the end.
    */
   public List<InternalDataFile> convertAddActionsToInternalDataFiles(
       List<AddFile> addFiles,
@@ -148,43 +159,169 @@ public class DeltaActionsConverter {
       boolean includeColumnStats,
       DeltaPartitionExtractor partitionExtractor,
       DeltaStatsExtractor fileStatsExtractor) {
+    return convertAddActionsToInternalDataFiles(
+        addFiles,
+        tableBasePath,
+        fileFormat,
+        partitionFields,
+        fields,
+        includeColumnStats,
+        partitionExtractor,
+        fileStatsExtractor,
+        TimeUnit.SECONDS.toMillis(Long.getLong(PROGRESS_LOG_INTERVAL_SECONDS, 30)));
+  }
+
+  @VisibleForTesting
+  List<InternalDataFile> convertAddActionsToInternalDataFiles(
+      List<AddFile> addFiles,
+      String tableBasePath,
+      FileFormat fileFormat,
+      List<InternalPartitionField> partitionFields,
+      List<InternalField> fields,
+      boolean includeColumnStats,
+      DeltaPartitionExtractor partitionExtractor,
+      DeltaStatsExtractor fileStatsExtractor,
+      long progressLogIntervalMillis) {
     long startMillis = System.currentTimeMillis();
+    BatchProgress progress = new BatchProgress(tableBasePath, addFiles, startMillis);
     List<CompletableFuture<InternalDataFile>> futures = new ArrayList<>(addFiles.size());
     for (AddFile addFile : addFiles) {
+      boolean readsFooter = StringUtils.isEmpty(addFile.stats());
       futures.add(
           CompletableFuture.supplyAsync(
-              () ->
-                  convertAddActionToInternalDataFile(
-                      addFile,
-                      tableBasePath,
-                      fileFormat,
-                      partitionFields,
-                      fields,
-                      includeColumnStats,
-                      partitionExtractor,
-                      fileStatsExtractor),
+              () -> {
+                InternalDataFile dataFile =
+                    convertAddActionToInternalDataFile(
+                        addFile,
+                        tableBasePath,
+                        fileFormat,
+                        partitionFields,
+                        fields,
+                        includeColumnStats,
+                        partitionExtractor,
+                        fileStatsExtractor);
+                progress.recordConverted(readsFooter, dataFile.getRecordCount());
+                return dataFile;
+              },
               EXECUTOR));
     }
-    List<InternalDataFile> dataFiles;
+    List<InternalDataFile> dataFiles = new ArrayList<>(addFiles.size());
+    long nextProgressLogMillis = startMillis + progressLogIntervalMillis;
     try {
-      dataFiles = futures.stream().map(CompletableFuture::join).collect(Collectors.toList());
-    } catch (CompletionException e) {
+      for (CompletableFuture<InternalDataFile> future : futures) {
+        while (true) {
+          long nowMillis = System.currentTimeMillis();
+          if (nowMillis >= nextProgressLogMillis) {
+            progress.logProgress();
+            nextProgressLogMillis = nowMillis + progressLogIntervalMillis;
+          }
+          try {
+            long waitMillis = Math.max(1, nextProgressLogMillis - System.currentTimeMillis());
+            dataFiles.add(future.get(waitMillis, TimeUnit.MILLISECONDS));
+            break;
+          } catch (TimeoutException e) {
+            // still running; log progress on the next pass
+          }
+        }
+      }
+    } catch (ExecutionException e) {
       futures.forEach(future -> future.cancel(true));
       if (e.getCause() instanceof RuntimeException) {
         throw (RuntimeException) e.getCause();
       }
-      throw e;
+      if (e.getCause() instanceof Error) {
+        throw (Error) e.getCause();
+      }
+      throw new ReadException("Failed to convert Delta add actions for " + tableBasePath, e);
+    } catch (InterruptedException e) {
+      futures.forEach(future -> future.cancel(true));
+      Thread.currentThread().interrupt();
+      throw new ReadException("Interrupted converting Delta add actions for " + tableBasePath, e);
     }
-    long withoutStats = addFiles.stream().filter(f -> StringUtils.isEmpty(f.stats())).count();
-    if (withoutStats > 0) {
-      log.info(
-          "Converted {} Delta add actions for {} in {} ms; {} had no Delta stats and were read from Parquet footers",
-          addFiles.size(),
-          tableBasePath,
-          System.currentTimeMillis() - startMillis,
-          withoutStats);
-    }
+    progress.logSummary(progressLogIntervalMillis);
     return dataFiles;
+  }
+
+  /** Counts for one batch of AddFile actions; updated by the converter threads. */
+  private static class BatchProgress {
+    private final String tableBasePath;
+    private final List<AddFile> addFiles;
+    private final long startMillis;
+    private final long total;
+    private final long withoutStats;
+    private final AtomicLong convertedFromDeltaStats = new AtomicLong();
+    private final AtomicLong convertedFromFooter = new AtomicLong();
+    private final AtomicLong footerZeroRecords = new AtomicLong();
+
+    BatchProgress(String tableBasePath, List<AddFile> addFiles, long startMillis) {
+      this.tableBasePath = tableBasePath;
+      this.addFiles = addFiles;
+      this.startMillis = startMillis;
+      this.total = addFiles.size();
+      this.withoutStats = addFiles.stream().filter(f -> StringUtils.isEmpty(f.stats())).count();
+    }
+
+    void recordConverted(boolean readFooter, long recordCount) {
+      if (readFooter) {
+        convertedFromFooter.incrementAndGet();
+        if (recordCount == 0) {
+          footerZeroRecords.incrementAndGet();
+        }
+      } else {
+        convertedFromDeltaStats.incrementAndGet();
+      }
+    }
+
+    void logProgress() {
+      long fromStats = convertedFromDeltaStats.get();
+      long fromFooter = convertedFromFooter.get();
+      long done = fromStats + fromFooter;
+      log.info(
+          "Delta add actions for {}: {}/{} converted ({}%) after {} s; Delta stats {}/{}, Parquet footers {}/{} ({} returned 0 rows)",
+          tableBasePath,
+          done,
+          total,
+          total == 0 ? 100 : done * 100 / total,
+          (System.currentTimeMillis() - startMillis) / 1000,
+          fromStats,
+          total - withoutStats,
+          fromFooter,
+          withoutStats,
+          footerZeroRecords.get());
+    }
+
+    void logSummary(long quietBelowMillis) {
+      long elapsedMillis = System.currentTimeMillis() - startMillis;
+      if (withoutStats == 0 && elapsedMillis < quietBelowMillis) {
+        // fast batches with Delta stats for every file stay silent; one runs per incremental commit
+        return;
+      }
+      long partitionsWithoutStats =
+          withoutStats == 0
+              ? 0
+              : addFiles.stream()
+                  .filter(f -> StringUtils.isEmpty(f.stats()))
+                  .map(f -> String.valueOf(f.partitionValues()))
+                  .distinct()
+                  .count();
+      String message =
+          "Converted {} Delta add actions for {} in {} ms: {} used Delta stats, {} were read from Parquet footers across {} partition(s), {} footer reads returned 0 rows";
+      Object[] args = {
+        total,
+        tableBasePath,
+        elapsedMillis,
+        total - withoutStats,
+        withoutStats,
+        partitionsWithoutStats,
+        footerZeroRecords.get()
+      };
+      if (footerZeroRecords.get() > 0) {
+        // 0 rows from a footer means the read failed or the file is empty; see the earlier WARN
+        log.warn(message, args);
+      } else {
+        log.info(message, args);
+      }
+    }
   }
 
   public InternalDataFile convertRemoveActionToInternalDataFile(
