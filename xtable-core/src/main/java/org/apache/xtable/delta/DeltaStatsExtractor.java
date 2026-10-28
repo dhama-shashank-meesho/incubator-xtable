@@ -18,6 +18,7 @@
  
 package org.apache.xtable.delta;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -41,6 +42,10 @@ import org.apache.xtable.model.stat.FileStats;
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
 public class DeltaStatsExtractor {
   private static final DeltaStatsExtractor INSTANCE = new DeltaStatsExtractor();
+  // Column stats taken from the Delta log's own stats are limited to the first N columns (-1: all).
+  // Converted stats are held in memory for every file until the commit, so a full sync of a table
+  // with millions of files can set this to bound memory; row counts are always kept.
+  private static final int MAX_COLUMNS = Integer.getInteger("xtable.delta.statsMaxColumns", -1);
 
   private final DeltaParquetFooterStatsReader footerStatsReader =
       new DeltaParquetFooterStatsReader(new Configuration());
@@ -72,7 +77,24 @@ public class DeltaStatsExtractor {
    * @return FileStats containing column statistics
    */
   public FileStats getColumnStatsForFile(AddFile addFile, List<InternalField> fields) {
-    return DeltaStatsUtils.parseColumnStatsFromJson(addFile.stats(), fields);
+    return limitColumnStats(
+        DeltaStatsUtils.parseColumnStatsFromJson(addFile.stats(), fields), MAX_COLUMNS);
+  }
+
+  /**
+   * Keeps the column stats of the first {@code maxColumns} columns; the record count is always
+   * kept. A negative value keeps all columns.
+   */
+  @VisibleForTesting
+  static FileStats limitColumnStats(FileStats stats, int maxColumns) {
+    if (maxColumns < 0
+        || stats.getColumnStats() == null
+        || stats.getColumnStats().size() <= maxColumns) {
+      return stats;
+    }
+    return stats.toBuilder()
+        .columnStats(new ArrayList<>(stats.getColumnStats().subList(0, maxColumns)))
+        .build();
   }
 
   /**
