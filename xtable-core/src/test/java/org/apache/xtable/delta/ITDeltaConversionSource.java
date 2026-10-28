@@ -504,6 +504,41 @@ public class ITDeltaConversionSource {
   }
 
   @Test
+  void fullSyncFileListingInSmallBatchesMatchesSnapshot() throws Exception {
+    TestSparkDeltaTable testSparkDeltaTable =
+        new TestSparkDeltaTable(
+            GenericTable.getTableName(), tempDir, sparkSession, "yearOfBirth", false);
+    for (int i = 0; i < 4; i++) {
+      testSparkDeltaTable.insertRows(20);
+    }
+    List<String> activeFiles = testSparkDeltaTable.getAllActiveFiles();
+    assertTrue(activeFiles.size() > 3, "need more files than the batch size");
+
+    DeltaLog deltaLog = DeltaLog.forTable(sparkSession, testSparkDeltaTable.getBasePath());
+    org.apache.spark.sql.delta.Snapshot snapshot = deltaLog.snapshot();
+    InternalSchema schema =
+        DeltaSchemaExtractor.getInstance().toInternalSchema(snapshot.metadata().schema());
+    List<InternalDataFile> dataFiles = new ArrayList<>();
+    try (org.apache.xtable.spi.extractor.DataFileIterator iterator =
+        DeltaDataFileExtractor.builder().build().iterator(snapshot, schema, 3)) {
+      iterator.forEachRemaining(dataFiles::add);
+    }
+
+    assertEquals(
+        activeFiles.stream()
+            .map(path -> path.replaceFirst("^file:/+", "/"))
+            .sorted()
+            .collect(Collectors.toList()),
+        dataFiles.stream()
+            .map(file -> file.getPhysicalPath().replaceFirst("^file:/+", "/"))
+            .sorted()
+            .collect(Collectors.toList()));
+    assertEquals(
+        testSparkDeltaTable.getNumRows(),
+        dataFiles.stream().mapToLong(InternalDataFile::getRecordCount).sum());
+  }
+
+  @Test
   public void testsShowingVacuumHasNoEffectOnIncrementalSync() {
     boolean isPartitioned = true;
     String tableName = GenericTable.getTableName();
