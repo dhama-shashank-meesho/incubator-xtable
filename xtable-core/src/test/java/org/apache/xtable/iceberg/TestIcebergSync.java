@@ -53,6 +53,7 @@ import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 import lombok.SneakyThrows;
 
@@ -103,6 +104,7 @@ import org.apache.xtable.model.storage.FileFormat;
 import org.apache.xtable.model.storage.InternalDataFile;
 import org.apache.xtable.model.storage.PartitionFileGroup;
 import org.apache.xtable.model.storage.TableFormat;
+import org.apache.xtable.model.sync.SyncResult;
 import org.apache.xtable.schema.SchemaFieldFinder;
 import org.apache.xtable.spi.sync.TableFormatSync;
 
@@ -962,6 +964,100 @@ public class TestIcebergSync {
     Optional<String> targetIdentifier = conversionTarget.getTargetCommitIdentifier("0");
     // The targetIdentifier is expected to not be found
     assertFalse(targetIdentifier.isPresent());
+  }
+
+  @Test
+  public void testSnapshotsExpiredOnFirstCommitOfRunOnly() throws Exception {
+    InternalTable table =
+        getInternalTable(tableName, basePath, internalSchema, null, LAST_COMMIT_TIME);
+    InternalDataFile dataFile1 = getDataFile(1, Collections.emptyList());
+    InternalDataFile dataFile2 = getDataFile(2, Collections.emptyList());
+    InternalDataFile dataFile3 = getDataFile(3, Collections.emptyList());
+    InternalDataFile dataFile4 = getDataFile(4, Collections.emptyList());
+    when(mockSchemaExtractor.toIceberg(internalSchema)).thenReturn(icebergSchema);
+    when(mockPartitionSpecExtractor.toIceberg(eq(null), any()))
+        .thenReturn(PartitionSpec.unpartitioned());
+    mockColStatsForFile(dataFile1, 1);
+    mockColStatsForFile(dataFile2, 1);
+    mockColStatsForFile(dataFile3, 1);
+    mockColStatsForFile(dataFile4, 1);
+
+    // one run: only its first commit expires, so the later commits keep every snapshot
+    IcebergConversionTarget firstRun = getConversionTargetWithZeroRetention();
+    syncSnapshot(firstRun, buildSnapshot(table, "0", dataFile1));
+    syncSnapshot(firstRun, buildSnapshot(table, "1", dataFile1, dataFile2));
+    syncSnapshot(firstRun, buildSnapshot(table, "2", dataFile1, dataFile2, dataFile3));
+    assertEquals(3, Iterables.size(getTable(basePath).snapshots()));
+    assertEquals(3, countManifestLists());
+
+    // the next run's first commit expires everything past retention and cleans up its files
+    IcebergConversionTarget secondRun = getConversionTargetWithZeroRetention();
+    syncSnapshot(secondRun, buildSnapshot(table, "3", dataFile1, dataFile2, dataFile3, dataFile4));
+    Table icebergTable = getTable(basePath);
+    assertEquals(1, Iterables.size(icebergTable.snapshots()));
+    assertEquals(1, countManifestLists());
+    validateIcebergTable(
+        tableName,
+        table,
+        Sets.newHashSet(dataFile1, dataFile2, dataFile3, dataFile4),
+        null,
+        icebergSchema);
+  }
+
+  @Test
+  public void testSnapshotsExpiredOnEveryCommitWithZeroInterval() throws Exception {
+    InternalTable table =
+        getInternalTable(tableName, basePath, internalSchema, null, LAST_COMMIT_TIME);
+    InternalDataFile dataFile1 = getDataFile(1, Collections.emptyList());
+    InternalDataFile dataFile2 = getDataFile(2, Collections.emptyList());
+    InternalDataFile dataFile3 = getDataFile(3, Collections.emptyList());
+    when(mockSchemaExtractor.toIceberg(internalSchema)).thenReturn(icebergSchema);
+    when(mockPartitionSpecExtractor.toIceberg(eq(null), any()))
+        .thenReturn(PartitionSpec.unpartitioned());
+    mockColStatsForFile(dataFile1, 1);
+    mockColStatsForFile(dataFile2, 1);
+    mockColStatsForFile(dataFile3, 1);
+
+    IcebergConversionTarget target = getConversionTargetWithZeroRetention();
+    target.setSnapshotExpiryInterval(Duration.ZERO);
+    syncSnapshot(target, buildSnapshot(table, "0", dataFile1));
+    syncSnapshot(target, buildSnapshot(table, "1", dataFile1, dataFile2));
+    syncSnapshot(target, buildSnapshot(table, "2", dataFile1, dataFile2, dataFile3));
+    assertEquals(1, Iterables.size(getTable(basePath).snapshots()));
+    assertEquals(1, countManifestLists());
+  }
+
+  private IcebergConversionTarget getConversionTargetWithZeroRetention() {
+    return new IcebergConversionTarget(
+        TargetTable.builder()
+            .basePath(basePath.toString())
+            .name(tableName)
+            .metadataRetention(Duration.ZERO)
+            .formatName(TableFormat.ICEBERG)
+            .build(),
+        CONFIGURATION,
+        mockSchemaExtractor,
+        mockSchemaSync,
+        mockPartitionSpecExtractor,
+        mockPartitionSpecSync,
+        IcebergDataFileUpdatesSync.of(
+            mockColumnStatsConverter, IcebergPartitionValueConverter.getInstance()),
+        IcebergTableManager.of(CONFIGURATION));
+  }
+
+  private void syncSnapshot(IcebergConversionTarget target, InternalSnapshot snapshot) {
+    Map<String, SyncResult> results =
+        TableFormatSync.getInstance().syncSnapshot(Collections.singletonList(target), snapshot);
+    assertEquals(
+        SyncResult.SyncStatus.SUCCESS,
+        results.get(TableFormat.ICEBERG).getTableFormatSyncStatus(),
+        "sync of " + snapshot.getSourceIdentifier() + " failed");
+  }
+
+  private long countManifestLists() throws IOException {
+    try (Stream<Path> files = Files.list(basePath.resolve("metadata"))) {
+      return files.filter(file -> file.getFileName().toString().startsWith("snap-")).count();
+    }
   }
 
   private InternalSnapshot buildSnapshot(

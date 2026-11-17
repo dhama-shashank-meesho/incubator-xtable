@@ -18,6 +18,7 @@
  
 package org.apache.xtable.iceberg;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
@@ -52,6 +53,8 @@ import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.util.ThreadPools;
 
+import com.google.common.annotations.VisibleForTesting;
+
 import org.apache.xtable.conversion.TargetTable;
 import org.apache.xtable.model.InternalTable;
 import org.apache.xtable.model.metadata.TableSyncMetadata;
@@ -65,6 +68,13 @@ import org.apache.xtable.spi.sync.ConversionTarget;
 @Log4j2
 public class IcebergConversionTarget implements ConversionTarget {
   private static final String METADATA_DIR_PATH = "/metadata/";
+  // Expiring snapshots with file cleanup reads the manifest list of every retained snapshot one at
+  // a time, which dominates the commit time of a table that commits often (~4k snapshots take
+  // minutes on GCS). Snapshots are expired on the first commit of a sync run and then at most once
+  // per this interval. A skipped expiry is only deferred: the next one expires and cleans up
+  // everything past retention, so it leaves no orphan files. 0 expires on every commit.
+  private static final Duration DEFAULT_SNAPSHOT_EXPIRY_INTERVAL =
+      Duration.ofMinutes(Long.getLong("xtable.iceberg.snapshotExpiryIntervalMinutes", 60));
   private IcebergSchemaExtractor schemaExtractor;
   private IcebergSchemaSync schemaSync;
   private IcebergPartitionSpecExtractor partitionSpecExtractor;
@@ -76,6 +86,9 @@ public class IcebergConversionTarget implements ConversionTarget {
   private IcebergCatalogConfig catalogConfig;
   private Configuration configuration;
   private int snapshotRetentionInHours;
+  private Duration snapshotExpiryInterval = DEFAULT_SNAPSHOT_EXPIRY_INTERVAL;
+  // when this target last expired snapshots; null until its first commit
+  private Instant lastSnapshotExpiry;
   private Transaction transaction;
   private Table table;
   private InternalTable internalTableState;
@@ -292,17 +305,35 @@ public class IcebergConversionTarget implements ConversionTarget {
 
   @Override
   public void completeSync() {
-    transaction
-        .expireSnapshots()
-        .expireOlderThan(
-            Instant.now().minus(snapshotRetentionInHours, ChronoUnit.HOURS).toEpochMilli())
-        .deleteWith(this::safeDelete) // ensures that only metadata files are deleted
-        .cleanExpiredFiles(true)
-        .commit();
+    Instant now = Instant.now();
+    boolean expireSnapshots =
+        lastSnapshotExpiry == null
+            || !now.isBefore(lastSnapshotExpiry.plus(snapshotExpiryInterval));
+    if (expireSnapshots) {
+      transaction
+          .expireSnapshots()
+          .expireOlderThan(now.minus(snapshotRetentionInHours, ChronoUnit.HOURS).toEpochMilli())
+          .deleteWith(this::safeDelete) // ensures that only metadata files are deleted
+          .cleanExpiredFiles(true)
+          .commit();
+      log.info(
+          "Expired snapshots older than {} hours for table {} in {} ms",
+          snapshotRetentionInHours,
+          tableIdentifier,
+          Duration.between(now, Instant.now()).toMillis());
+    }
     transaction.commitTransaction();
+    if (expireSnapshots) {
+      lastSnapshotExpiry = now;
+    }
     transaction = null;
     internalTableState = null;
     tableSyncMetadata = null;
+  }
+
+  @VisibleForTesting
+  void setSnapshotExpiryInterval(Duration snapshotExpiryInterval) {
+    this.snapshotExpiryInterval = snapshotExpiryInterval;
   }
 
   private void safeDelete(String file) {
