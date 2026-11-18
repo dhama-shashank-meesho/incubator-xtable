@@ -35,7 +35,10 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import org.apache.iceberg.catalog.TableIdentifier;
+
 import org.apache.xtable.conversion.CatalogConfig;
+import org.apache.xtable.iceberg.IcebergCatalogConfig;
 import org.apache.xtable.utilities.RunSync.DatasetConfig;
 import org.apache.xtable.utilities.RunSync.TableFormatConverters;
 import org.apache.xtable.utilities.RunSync.TableFormatConverters.ConversionConfig;
@@ -208,5 +211,82 @@ class TestRunSync {
     Assertions.assertEquals(
         "false",
         RunSync.getSourceConfiguration(converters.toString(), datasetConfig).get(reuseKey));
+  }
+
+  private static DatasetConfig.Table table(String name, String basePath) {
+    return DatasetConfig.Table.builder().tableName(name).tableBasePath(basePath).build();
+  }
+
+  private static DatasetConfig dataset(String sourceFormat, DatasetConfig.Table table) {
+    return new DatasetConfig(
+        sourceFormat, Collections.singletonList(DELTA), Collections.singletonList(table));
+  }
+
+  @Test
+  void icebergSourceNamedDbDotTableIsReadThroughHms() {
+    DatasetConfig.Table table = table("silver.poc_conv_t", "gs://bucket/path/t");
+    RunSync.HmsSource hmsSource =
+        RunSync.resolveHmsSource(dataset(ICEBERG, table), table, null, Collections.emptyMap());
+
+    Assertions.assertNotNull(hmsSource);
+    Assertions.assertEquals("silver", hmsSource.getTable().getNamespace());
+    Assertions.assertEquals("poc_conv_t", hmsSource.getTable().getTableName());
+    Assertions.assertEquals("gs://bucket/path/t", hmsSource.getTable().getTableBasePath());
+    Assertions.assertEquals(
+        RunSync.HIVE_CATALOG_IMPL, hmsSource.getCatalogConfig().getCatalogImpl());
+    Assertions.assertEquals(
+        RunSync.DEFAULT_HMS_URI, hmsSource.getCatalogConfig().getCatalogOptions().get("uri"));
+  }
+
+  @Test
+  void hmsUriComesFromTheEnvironment() {
+    DatasetConfig.Table table = table("silver.t", "gs://bucket/t");
+    RunSync.HmsSource hmsSource =
+        RunSync.resolveHmsSource(
+            dataset(ICEBERG, table),
+            table,
+            null,
+            Collections.singletonMap(RunSync.HMS_URI_ENV, "thrift://localhost:9083"));
+
+    Assertions.assertEquals(
+        "thrift://localhost:9083", hmsSource.getCatalogConfig().getCatalogOptions().get("uri"));
+  }
+
+  @Test
+  void otherTablesAreReadAsBefore() {
+    DatasetConfig.Table dotted = table("silver.t", "gs://bucket/t");
+    // Delta -> Iceberg (the service's monitored tables) is never affected.
+    Assertions.assertNull(
+        RunSync.resolveHmsSource(dataset(DELTA, dotted), dotted, null, Collections.emptyMap()));
+    // An explicit --icebergCatalogConfig wins.
+    CatalogConfig explicit =
+        IcebergCatalogConfig.builder().catalogName("c").catalogImpl("impl").build();
+    Assertions.assertNull(
+        RunSync.resolveHmsSource(
+            dataset(ICEBERG, dotted), dotted, explicit, Collections.emptyMap()));
+    // Names without exactly one database part stay by path.
+    for (String name : new String[] {"t", "a.b.c", ".t", "db.", "db.t-1"}) {
+      DatasetConfig.Table table = table(name, "gs://bucket/t");
+      Assertions.assertNull(
+          RunSync.resolveHmsSource(dataset(ICEBERG, table), table, null, Collections.emptyMap()),
+          name);
+    }
+  }
+
+  @Test
+  void hmsLocationMustMatchTableBasePath() {
+    TableIdentifier identifier = TableIdentifier.of("silver", "t");
+    RunSync.checkLocation(identifier, "gs://bucket/t", "gs://bucket/t/");
+    RunSync.checkLocation(identifier, "gs://bucket/t/", "gs://bucket/t");
+    RunSync.checkLocation(identifier, "file:///tmp/t", "file:/tmp/t");
+
+    IllegalStateException e =
+        Assertions.assertThrows(
+            IllegalStateException.class,
+            () -> RunSync.checkLocation(identifier, "gs://bucket/other", "gs://bucket/t"));
+    Assertions.assertTrue(e.getMessage().contains("gs://bucket/other"), e.getMessage());
+    Assertions.assertThrows(
+        IllegalStateException.class,
+        () -> RunSync.checkLocation(identifier, "gs://bucket/t2", "gs://bucket/t"));
   }
 }
