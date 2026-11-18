@@ -50,7 +50,19 @@ class TestDeltaPathUtils {
             "s3://other-bucket/x/part-0.parquet"),
         Arguments.of(
             "s3a://bucket/tab", "file:///local/t/part-0.parquet", "file:///local/t/part-0.parquet"),
-        Arguments.of("/tmp/tab", "/tmp/other/part-0.parquet", "/tmp/other/part-0.parquet"));
+        Arguments.of("/tmp/tab", "/tmp/other/part-0.parquet", "/tmp/other/part-0.parquet"),
+        // paths in the Delta log are URI-encoded
+        Arguments.of(
+            "s3a://bucket/tab",
+            "s=a%252Fb+c%253D%2525/part-0.parquet",
+            "s3a://bucket/tab/s=a%2Fb+c%3D%25/part-0.parquet"),
+        Arguments.of(
+            "s3a://bucket/tab", "s=a%20b/part-0.parquet", "s3a://bucket/tab/s=a b/part-0.parquet"),
+        Arguments.of(
+            "s3a://bucket/tab", "s3://bucket/x/a%20b.parquet", "s3://bucket/x/a b.parquet"),
+        // not a valid URI, so not encoded by its writer
+        Arguments.of(
+            "s3a://bucket/tab", "s=a b/part-0%.parquet", "s3a://bucket/tab/s=a b/part-0%.parquet"));
   }
 
   @ParameterizedTest
@@ -82,7 +94,36 @@ class TestDeltaPathUtils {
         Arguments.of(
             "s3a://bucket/tab",
             "s3a://bucket/tab2/part-0.parquet",
-            "s3a://bucket/tab2/part-0.parquet"));
+            "s3a://bucket/tab2/part-0.parquet"),
+        // the recorded path is URI-encoded: Iceberg escapes "a/b c=%" as a%2Fb+c%3D%25
+        Arguments.of(
+            "s3a://bucket/tab",
+            "s3a://bucket/tab/s=a%2Fb+c%3D%25/part-0.parquet",
+            "s=a%252Fb+c%253D%2525/part-0.parquet"),
+        Arguments.of(
+            "s3a://bucket/tab", "s3a://bucket/tab/s=a b/part-0.parquet", "s=a%20b/part-0.parquet"),
+        Arguments.of(
+            "s3a://bucket/tab2", "s3://bucket/x/a b.parquet", "s3://bucket/x/a%20b.parquet"));
+  }
+
+  @ParameterizedTest
+  @MethodSource("roundTripPaths")
+  void pathForDeltaLogResolvesBackToTheFile(String dataFilePath) {
+    String base = "s3a://bucket/tab";
+    assertEquals(
+        dataFilePath,
+        DeltaPathUtils.getFullPathToFile(
+            base, DeltaPathUtils.getPathForDeltaLog(base, dataFilePath)));
+  }
+
+  private static Stream<String> roundTripPaths() {
+    return Stream.of(
+        "s3a://bucket/tab/part-0.parquet",
+        "s3a://bucket/tab/year=2024/part-0.parquet",
+        "s3a://bucket/tab/s=a%2Fb+c%3D%25/part-0.parquet",
+        "s3a://bucket/tab/s=a b/part-0.parquet",
+        "s3a://bucket/tab/s=%C3%A9/part-0.parquet",
+        "s3a://bucket/tab/s=é/part-0.parquet");
   }
 
   @ParameterizedTest

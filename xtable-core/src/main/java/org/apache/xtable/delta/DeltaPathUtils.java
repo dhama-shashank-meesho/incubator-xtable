@@ -18,7 +18,11 @@
  
 package org.apache.xtable.delta;
 
+import java.io.UnsupportedEncodingException;
 import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 
 import lombok.AccessLevel;
@@ -48,12 +52,13 @@ public class DeltaPathUtils {
    * @return the full absolute path to the file
    */
   public static String getFullPathToFile(String tableBasePath, String dataFilePath) {
-    if (isAbsolutePath(dataFilePath)) {
-      return dataFilePath;
+    String path = decode(dataFilePath);
+    if (isAbsolutePath(path)) {
+      return path;
     }
     return tableBasePath.endsWith(Path.SEPARATOR)
-        ? tableBasePath + dataFilePath
-        : tableBasePath + Path.SEPARATOR + dataFilePath;
+        ? tableBasePath + path
+        : tableBasePath + Path.SEPARATOR + path;
   }
 
   /**
@@ -70,8 +75,37 @@ public class DeltaPathUtils {
    */
   public static String getPathForDeltaLog(String tableBasePath, String dataFilePath) {
     return isUnderBasePath(tableBasePath, dataFilePath)
-        ? PathUtils.getRelativePath(dataFilePath, tableBasePath)
-        : dataFilePath;
+        ? encodeRelative(PathUtils.getRelativePath(dataFilePath, tableBasePath))
+        : new Path(dataFilePath).toUri().toString();
+  }
+
+  // Paths in the Delta log are URI-encoded (PROTOCOL.md, "Add File and Remove File"). Without the
+  // encoding a file under an escaped partition directory, e.g. s=a%2Fb from a value "a/b", is
+  // decoded by Delta readers to a directory that does not exist.
+  private static String encodeRelative(String relativePath) {
+    try {
+      return new URI(null, null, relativePath, null).toString();
+    } catch (URISyntaxException e) {
+      throw new IllegalArgumentException("Cannot encode data file path " + relativePath, e);
+    }
+  }
+
+  // Decodes the %XX escapes of a Delta log path. "+" is literal in a URI path, so it is kept. A
+  // path that is not a valid URI was not encoded by its writer and is used as-is.
+  private static String decode(String deltaLogPath) {
+    if (deltaLogPath.indexOf('%') < 0) {
+      return deltaLogPath;
+    }
+    try {
+      new URI(deltaLogPath);
+    } catch (URISyntaxException e) {
+      return deltaLogPath;
+    }
+    try {
+      return URLDecoder.decode(deltaLogPath.replace("+", "%2B"), StandardCharsets.UTF_8.name());
+    } catch (UnsupportedEncodingException e) {
+      throw new IllegalStateException(e);
+    }
   }
 
   private static boolean isUnderBasePath(String tableBasePath, String dataFilePath) {
