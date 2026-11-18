@@ -491,33 +491,30 @@ public class ITIcebergToDeltaConversion {
 
   private void checkFilters(String table, List<String> zones, String... predicates) {
     List<String> mismatches = new java.util.ArrayList<>();
-    String original = spark.conf().get("spark.sql.session.timeZone");
-    try {
-      for (String zone : zones) {
-        spark.conf().set("spark.sql.session.timeZone", zone);
-        for (String predicate : predicates) {
-          long expected = spark.table(CATALOG + table).where(predicate).count();
-          long actual = spark.read().format("delta").load(basePath(table)).where(predicate).count();
-          System.out.println(
-              "I2D-FILTER "
-                  + table
-                  + " ["
-                  + predicate
-                  + "] session="
-                  + zone
-                  + " iceberg="
-                  + expected
-                  + " delta="
-                  + actual
-                  + (expected == actual ? " OK" : " MISMATCH"));
-          if (expected != actual) {
-            mismatches.add(
-                predicate + " in " + zone + ": iceberg " + expected + ", delta " + actual);
-          }
+    for (String zone : zones) {
+      // a session of its own: tests run concurrently and share the SparkSession, so setting the
+      // time zone on it would change the zone other tests read in
+      SparkSession session = spark.newSession();
+      session.conf().set("spark.sql.session.timeZone", zone);
+      for (String predicate : predicates) {
+        long expected = session.table(CATALOG + table).where(predicate).count();
+        long actual = session.read().format("delta").load(basePath(table)).where(predicate).count();
+        System.out.println(
+            "I2D-FILTER "
+                + table
+                + " ["
+                + predicate
+                + "] session="
+                + zone
+                + " iceberg="
+                + expected
+                + " delta="
+                + actual
+                + (expected == actual ? " OK" : " MISMATCH"));
+        if (expected != actual) {
+          mismatches.add(predicate + " in " + zone + ": iceberg " + expected + ", delta " + actual);
         }
       }
-    } finally {
-      spark.conf().set("spark.sql.session.timeZone", original);
     }
     assertEquals(Collections.emptyList(), mismatches, table + ": filter results differ");
   }
