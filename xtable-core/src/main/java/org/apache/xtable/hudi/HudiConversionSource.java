@@ -18,13 +18,18 @@
  
 package org.apache.xtable.hudi;
 
+import static org.apache.hudi.common.table.timeline.InstantComparison.LESSER_THAN_OR_EQUALS;
+
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import lombok.Builder;
 import lombok.NonNull;
@@ -36,11 +41,10 @@ import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
-import org.apache.hudi.common.table.timeline.TimelineMetadataUtils;
+import org.apache.hudi.common.table.timeline.InstantComparison;
 import org.apache.hudi.common.util.Option;
 
-import com.google.common.collect.Iterators;
-import com.google.common.collect.PeekingIterator;
+import com.google.common.base.Strings;
 
 import org.apache.xtable.collectors.CustomCollectors;
 import org.apache.xtable.exception.ReadException;
@@ -80,13 +84,7 @@ public class HudiConversionSource implements ConversionSource<HoodieInstant> {
   public InternalTable getCurrentTable() {
     HoodieActiveTimeline activeTimeline = metaClient.getActiveTimeline();
     HoodieTimeline completedTimeline = activeTimeline.filterCompletedInstants();
-    // get latest commit
-    HoodieInstant latestCommit =
-        completedTimeline
-            .lastInstant()
-            .orElseThrow(
-                () -> new ReadException("Unable to read latest commit from Hudi source table"));
-    return getTable(latestCommit);
+    return getTable(getLatestCompletedInstant(completedTimeline));
   }
 
   @Override
@@ -94,16 +92,18 @@ public class HudiConversionSource implements ConversionSource<HoodieInstant> {
     HoodieActiveTimeline activeTimeline = metaClient.getActiveTimeline();
     HoodieTimeline completedTimeline = activeTimeline.filterCompletedInstants();
     // get latest commit
-    HoodieInstant latestCommit =
-        completedTimeline
-            .lastInstant()
-            .orElseThrow(
-                () -> new ReadException("Unable to read latest commit from Hudi source table"));
+    HoodieInstant latestCommit = getLatestCompletedInstant(completedTimeline);
+    // On table version 9 (timeline layout V2) a commit becomes visible at its completion time, so
+    // an instant with an earlier requested time may complete after the latest commit. Capture all
+    // currently inflight/requested instants as pending so none are missed; on version 6 keep the
+    // historical requested-time window.
     List<HoodieInstant> pendingInstants =
-        activeTimeline
-            .filterInflightsAndRequested()
-            .findInstantsBefore(latestCommit.getTimestamp())
-            .getInstants();
+        usesCompletionTimeOrdering()
+            ? activeTimeline.filterInflightsAndRequested().getInstants()
+            : activeTimeline
+                .filterInflightsAndRequested()
+                .findInstantsBefore(latestCommit.requestedTime())
+                .getInstants();
     InternalTable table = getTable(latestCommit);
     return InternalSnapshot.builder()
         .table(table)
@@ -112,7 +112,7 @@ public class HudiConversionSource implements ConversionSource<HoodieInstant> {
             pendingInstants.stream()
                 .map(
                     hoodieInstant ->
-                        HudiInstantUtils.parseFromInstantTime(hoodieInstant.getTimestamp()))
+                        HudiInstantUtils.parseFromInstantTime(hoodieInstant.requestedTime()))
                 .collect(CustomCollectors.toList(pendingInstants.size())))
         .sourceIdentifier(getCommitIdentifier(latestCommit))
         .build();
@@ -121,10 +121,17 @@ public class HudiConversionSource implements ConversionSource<HoodieInstant> {
   @Override
   public TableChange getTableChangeForCommit(HoodieInstant hoodieInstantForDiff) {
     HoodieActiveTimeline activeTimeline = metaClient.getActiveTimeline();
+    // The set of commits visible as-of the diff commit is ordered by completion time on table
+    // version 9 (timeline layout V2) and by requested time on version 6.
     HoodieTimeline visibleTimeline =
-        activeTimeline
-            .filterCompletedInstants()
-            .findInstantsBeforeOrEquals(hoodieInstantForDiff.getTimestamp());
+        usesCompletionTimeOrdering()
+            ? activeTimeline
+                .filterCompletedInstants()
+                .findInstantsModifiedBeforeOrEqualsByCompletionTime(
+                    hoodieInstantForDiff.getCompletionTime())
+            : activeTimeline
+                .filterCompletedInstants()
+                .findInstantsBeforeOrEquals(hoodieInstantForDiff.requestedTime());
     InternalTable table = getTable(hoodieInstantForDiff);
     return TableChange.builder()
         .tableAsOfChange(table)
@@ -147,11 +154,15 @@ public class HudiConversionSource implements ConversionSource<HoodieInstant> {
     List<HoodieInstant> commitsToProcessNext =
         mergeAndDedupLists(
             lastPendingHoodieInstantsCommitsPair.getCompletedCommits(),
-            commitsPair.getCompletedCommits());
+            commitsPair.getCompletedCommits(),
+            hoodieInstant -> hoodieInstant.requestedTime() + "_" + hoodieInstant.getAction(),
+            instantOrdering());
     List<Instant> pendingInstantsToProcessNext =
         mergeAndDedupLists(
             lastPendingHoodieInstantsCommitsPair.getPendingCommits(),
-            commitsPair.getPendingCommits());
+            commitsPair.getPendingCommits(),
+            Function.identity(),
+            Comparator.naturalOrder());
     return CommitsBacklog.<HoodieInstant>builder()
         .commitsToProcess(commitsToProcessNext)
         .inFlightInstants(pendingInstantsToProcessNext)
@@ -165,7 +176,7 @@ public class HudiConversionSource implements ConversionSource<HoodieInstant> {
 
   @Override
   public String getCommitIdentifier(HoodieInstant commit) {
-    return commit.getTimestamp();
+    return commit.requestedTime();
   }
 
   private boolean doesCommitExistsAsOfInstant(Instant instant) {
@@ -175,18 +186,46 @@ public class HudiConversionSource implements ConversionSource<HoodieInstant> {
 
   @SneakyThrows
   private boolean isAffectedByCleanupProcess(Instant instant) {
+    // On table version 8+ the checkpoint is a completion time, but the cleaner retains commits by
+    // requested time, so check the cleaner against the requested time of the synced commit.
+    Instant cleanerCheckInstant =
+        usesCompletionTimeOrdering()
+            ? HudiInstantUtils.parseFromInstantTime(getCommitAtInstant(instant).requestedTime())
+            : instant;
     Option<HoodieInstant> lastCleanInstant =
         metaClient.getActiveTimeline().getCleanerTimeline().filterCompletedInstants().lastInstant();
     if (!lastCleanInstant.isPresent()) {
       return false;
     }
     HoodieCleanMetadata cleanMetadata =
-        TimelineMetadataUtils.deserializeHoodieCleanMetadata(
-            metaClient.getActiveTimeline().getInstantDetails(lastCleanInstant.get()).get());
+        metaClient.getActiveTimeline().readCleanMetadata(lastCleanInstant.get());
     String earliestCommitToRetain = cleanMetadata.getEarliestCommitToRetain();
+    if (Strings.isNullOrEmpty(earliestCommitToRetain)) {
+      return cleanInstantsOccurredSinceLastSyncedInstant(cleanerCheckInstant);
+    }
     Instant earliestCommitToRetainInstant =
         HudiInstantUtils.parseFromInstantTime(earliestCommitToRetain);
-    return earliestCommitToRetainInstant.isAfter(instant);
+    return earliestCommitToRetainInstant.isAfter(cleanerCheckInstant);
+  }
+
+  // When clean instants have empty earliestCommitToRetain, trigger full snapshot sync if any
+  // clean instants occurred after the last synced instant to err on the side of caution
+  private boolean cleanInstantsOccurredSinceLastSyncedInstant(Instant instant) {
+    String lastSyncedCommitTime = HudiInstantUtils.convertInstantToCommit(instant);
+    List<HoodieInstant> cleanInstantsAfterLastSync =
+        metaClient
+            .getActiveTimeline()
+            .getCleanerTimeline()
+            .filterCompletedInstants()
+            .filter(
+                cleanInstant ->
+                    InstantComparison.compareTimestamps(
+                        cleanInstant.requestedTime(),
+                        InstantComparison.GREATER_THAN,
+                        lastSyncedCommitTime))
+            .getInstants();
+
+    return !cleanInstantsAfterLastSync.isEmpty();
   }
 
   private CommitsPair getCompletedAndPendingCommitsForInstants(List<Instant> lastPendingInstants) {
@@ -200,7 +239,7 @@ public class HudiConversionSource implements ConversionSource<HoodieInstant> {
             .filter(hoodieInstant -> hoodieInstant.isInflight() || hoodieInstant.isRequested())
             .map(
                 hoodieInstant ->
-                    HudiInstantUtils.parseFromInstantTime(hoodieInstant.getTimestamp()))
+                    HudiInstantUtils.parseFromInstantTime(hoodieInstant.requestedTime()))
             .collect(Collectors.toList());
     return CommitsPair.builder()
         .completedCommits(lastPendingHoodieInstantsCompleted)
@@ -212,11 +251,58 @@ public class HudiConversionSource implements ConversionSource<HoodieInstant> {
     return metaClient.getActiveTimeline().filterCompletedInstants();
   }
 
+  private boolean usesCompletionTimeOrdering() {
+    return HudiInstantUtils.usesCompletionTimeOrdering(metaClient);
+  }
+
+  private HoodieInstant getLatestCompletedInstant(HoodieTimeline completedTimeline) {
+    return completedTimeline
+        .getInstantsAsStream()
+        .max(instantOrdering())
+        .orElseThrow(
+            () -> new ReadException("Unable to read latest commit from Hudi source table"));
+  }
+
+  /**
+   * Selects the commits that completed after the last synced commit's completion time, ordered by
+   * completion time. Unlike the requested-time path this also surfaces commits whose requested time
+   * is older than the last synced commit but whose completion is newer (out-of-order completion).
+   */
+  private CommitsPair getCompletedAndPendingCommitsAfterCompletionTime(
+      HoodieInstant commitInstant) {
+    List<HoodieInstant> modifiedAfter =
+        metaClient
+            .getActiveTimeline()
+            .findInstantsModifiedAfterByCompletionTime(commitInstant.getCompletionTime())
+            .getInstants();
+    List<HoodieInstant> completedInstants =
+        modifiedAfter.stream()
+            .filter(HoodieInstant::isCompleted)
+            .sorted(Comparator.comparing(HoodieInstant::getCompletionTime))
+            .collect(Collectors.toList());
+    List<Instant> pendingInstants =
+        modifiedAfter.stream()
+            .filter(hoodieInstant -> hoodieInstant.isInflight() || hoodieInstant.isRequested())
+            .map(
+                hoodieInstant ->
+                    HudiInstantUtils.parseFromInstantTime(hoodieInstant.requestedTime()))
+            .collect(Collectors.toList());
+    return CommitsPair.builder()
+        .completedCommits(completedInstants)
+        .pendingCommits(pendingInstants)
+        .build();
+  }
+
   private CommitsPair getCompletedAndPendingCommitsAfterInstant(HoodieInstant commitInstant) {
+    if (usesCompletionTimeOrdering()) {
+      return getCompletedAndPendingCommitsAfterCompletionTime(commitInstant);
+    }
+    // Table version 6 uses the old timeline view, so instants are selected and ordered by their
+    // requested (instant) time.
     List<HoodieInstant> allInstants =
         metaClient
             .getActiveTimeline()
-            .findInstantsAfter(commitInstant.getTimestamp())
+            .findInstantsAfter(commitInstant.requestedTime())
             .getInstants();
     // collect the completed instants & inflight instants from all the instants.
     List<HoodieInstant> completedInstants =
@@ -226,16 +312,19 @@ public class HudiConversionSource implements ConversionSource<HoodieInstant> {
       return CommitsPair.builder().completedCommits(completedInstants).build();
     }
     // remove from pending instants that are larger than the last completed instant.
+    HoodieInstant lastCompletedInstant = completedInstants.get(completedInstants.size() - 1);
     List<Instant> pendingInstants =
         allInstants.stream()
             .filter(hoodieInstant -> hoodieInstant.isInflight() || hoodieInstant.isRequested())
             .filter(
                 hoodieInstant ->
-                    hoodieInstant.compareTo(completedInstants.get(completedInstants.size() - 1))
-                        <= 0)
+                    InstantComparison.compareTimestamps(
+                        hoodieInstant.requestedTime(),
+                        LESSER_THAN_OR_EQUALS,
+                        lastCompletedInstant.requestedTime()))
             .map(
                 hoodieInstant ->
-                    HudiInstantUtils.parseFromInstantTime(hoodieInstant.getTimestamp()))
+                    HudiInstantUtils.parseFromInstantTime(hoodieInstant.requestedTime()))
             .collect(Collectors.toList());
     return CommitsPair.builder()
         .completedCommits(completedInstants)
@@ -244,9 +333,55 @@ public class HudiConversionSource implements ConversionSource<HoodieInstant> {
   }
 
   private HoodieInstant getCommitAtInstant(Instant instant) {
+    if (usesCompletionTimeOrdering()) {
+      return getCommitAtCompletionTime(instant);
+    }
     return getCompletedCommits()
         .findInstantsBeforeOrEquals(HudiInstantUtils.convertInstantToCommit(instant))
         .lastInstant()
+        .orElse(null);
+  }
+
+  /**
+   * Resolves a sync checkpoint on table version 8+, where the checkpoint is a completion time (see
+   * {@link HudiInstantUtils#getSyncInstant}). A checkpoint written while the source table was on
+   * version 6 holds a requested time, so an exact requested-time match is accepted next. Otherwise
+   * the last commit that completed at or before the checkpoint is returned.
+   */
+  private HoodieInstant getCommitAtCompletionTime(Instant instant) {
+    List<HoodieInstant> completedInstants =
+        getCompletedCommits().getInstants().stream()
+            .filter(hoodieInstant -> hoodieInstant.getCompletionTime() != null)
+            .collect(Collectors.toList());
+    Optional<HoodieInstant> completedAtInstant =
+        completedInstants.stream()
+            .filter(
+                hoodieInstant ->
+                    HudiInstantUtils.parseFromInstantTime(hoodieInstant.getCompletionTime())
+                        .equals(instant))
+            .findFirst();
+    if (completedAtInstant.isPresent()) {
+      return completedAtInstant.get();
+    }
+    // Savepoint instants reuse the requested time of the commit they pin, hence filtering.
+    Optional<HoodieInstant> requestedAtInstant =
+        completedInstants.stream()
+            .filter(
+                hoodieInstant -> !HoodieTimeline.SAVEPOINT_ACTION.equals(hoodieInstant.getAction()))
+            .filter(
+                hoodieInstant ->
+                    HudiInstantUtils.parseFromInstantTime(hoodieInstant.requestedTime())
+                        .equals(instant))
+            .findFirst();
+    if (requestedAtInstant.isPresent()) {
+      return requestedAtInstant.get();
+    }
+    return completedInstants.stream()
+        .filter(
+            hoodieInstant ->
+                !HudiInstantUtils.parseFromInstantTime(hoodieInstant.getCompletionTime())
+                    .isAfter(instant))
+        .max(Comparator.comparing(HoodieInstant::getCompletionTime))
         .orElse(null);
   }
 
@@ -262,7 +397,7 @@ public class HudiConversionSource implements ConversionSource<HoodieInstant> {
             .collect(
                 Collectors.toMap(
                     hoodieInstant ->
-                        HudiInstantUtils.parseFromInstantTime(hoodieInstant.getTimestamp()),
+                        HudiInstantUtils.parseFromInstantTime(hoodieInstant.requestedTime()),
                     hoodieInstant -> hoodieInstant));
     return instants.stream()
         .map(instantHoodieInstantMap::get)
@@ -271,39 +406,26 @@ public class HudiConversionSource implements ConversionSource<HoodieInstant> {
   }
 
   /**
-   * Merges commits from two lists and returns new list of sorted commits by eliminating duplicates.
-   *
-   * @param list1 First sorted input list of commits
-   * @param list2 Second sorted input list of commits.
-   * @return merged list of commits in sorted order.
+   * Merges two lists, keeps the first element for each key, and sorts the result. Commits are
+   * sorted with the timeline layout's ordering, which is the requested time on table version 6 and
+   * the completion time on version 9. Commits are keyed by requested time and action, because a
+   * savepoint instant reuses the requested time of the commit it pins.
    */
-  private <T extends Comparable<T>> List<T> mergeAndDedupLists(
-      @NonNull List<T> list1, @NonNull List<T> list2) {
-    List<T> mergedList = new ArrayList<>();
-    PeekingIterator<T> itr1 = Iterators.peekingIterator(list1.iterator());
-    PeekingIterator<T> itr2 = Iterators.peekingIterator(list2.iterator());
-    while (itr1.hasNext() || itr2.hasNext()) {
-      if (!itr2.hasNext()) {
-        mergedList.add(itr1.next());
-      } else if (!itr1.hasNext()) {
-        mergedList.add(itr2.next());
-      } else {
-        T element1 = itr1.peek();
-        T element2 = itr2.peek();
-        if (element1.compareTo(element2) < 0) {
-          mergedList.add(element1);
-          itr1.next();
-        } else if (element1.compareTo(element2) > 0) {
-          mergedList.add(element2);
-          itr2.next();
-        } else {
-          mergedList.add(element1);
-          itr1.next();
-          itr2.next();
-        }
-      }
-    }
-    return mergedList;
+  private <T, K> List<T> mergeAndDedupLists(
+      @NonNull List<T> list1,
+      @NonNull List<T> list2,
+      Function<T, K> keyExtractor,
+      Comparator<T> ordering) {
+    return Stream.concat(list1.stream(), list2.stream())
+        .collect(Collectors.toMap(keyExtractor, Function.identity(), (first, second) -> first))
+        .values()
+        .stream()
+        .sorted(ordering)
+        .collect(Collectors.toList());
+  }
+
+  private Comparator<HoodieInstant> instantOrdering() {
+    return metaClient.getTimelineLayout().getInstantComparator().orderingComparator();
   }
 
   @Override

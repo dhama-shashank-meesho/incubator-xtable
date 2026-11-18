@@ -22,7 +22,9 @@ import java.io.IOException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
@@ -49,8 +51,11 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.types.Type;
+import org.apache.iceberg.types.TypeUtil;
 
 import org.apache.xtable.conversion.SourceTable;
+import org.apache.xtable.exception.NotSupportedException;
 import org.apache.xtable.exception.ReadException;
 import org.apache.xtable.model.CommitsBacklog;
 import org.apache.xtable.model.InstantsForIncrementalSync;
@@ -108,7 +113,9 @@ public class IcebergConversionSource implements ConversionSource<Snapshot> {
   @Override
   public InternalTable getTable(Snapshot snapshot) {
     Table iceTable = getSourceTable();
-    Schema iceSchema = iceTable.schemas().get(snapshot.schemaId());
+    checkSchemaHistory(iceTable);
+    Schema iceSchema =
+        (snapshot != null) ? iceTable.schemas().get(snapshot.schemaId()) : iceTable.schema();
     TableOperations iceOps = ((BaseTable) iceTable).operations();
     IcebergSchemaExtractor schemaExtractor = IcebergSchemaExtractor.getInstance();
     InternalSchema irSchema = schemaExtractor.fromIceberg(iceSchema);
@@ -123,12 +130,19 @@ public class IcebergConversionSource implements ConversionSource<Snapshot> {
         irPartitionFields.size() > 0
             ? DataLayoutStrategy.HIVE_STYLE_PARTITION
             : DataLayoutStrategy.FLAT;
+
+    Instant latestCommitTime =
+        (snapshot != null)
+            ? Instant.ofEpochMilli(snapshot.timestampMillis())
+            : Instant.ofEpochMilli(
+                ((BaseTable) iceTable).operations().current().lastUpdatedMillis());
+
     return InternalTable.builder()
         .tableFormat(TableFormat.ICEBERG)
         .basePath(iceTable.location())
         .name(iceTable.name())
         .partitioningFields(irPartitionFields)
-        .latestCommitTime(Instant.ofEpochMilli(snapshot.timestampMillis()))
+        .latestCommitTime(latestCommitTime)
         .readSchema(irSchema)
         .layoutStrategy(dataLayoutStrategy)
         .latestMetadataPath(iceOps.current().metadataFileLocation())
@@ -147,6 +161,18 @@ public class IcebergConversionSource implements ConversionSource<Snapshot> {
     Table iceTable = getSourceTable();
 
     Snapshot currentSnapshot = iceTable.currentSnapshot();
+
+    if (currentSnapshot == null) {
+      // Handle empty table case - return snapshot with schema but no data files
+      InternalTable irTable = getTable(null);
+      return InternalSnapshot.builder()
+          .version("0")
+          .table(irTable)
+          .partitionedDataFiles(Collections.emptyList())
+          .sourceIdentifier("0")
+          .build();
+    }
+
     InternalTable irTable = getTable(currentSnapshot);
 
     TableScan scan =
@@ -157,6 +183,9 @@ public class IcebergConversionSource implements ConversionSource<Snapshot> {
       List<InternalDataFile> irFiles = new ArrayList<>();
       for (FileScanTask fileScanTask : files) {
         DataFile file = fileScanTask.file();
+        if (!fileScanTask.deletes().isEmpty()) {
+          throw deleteFilesNotSupported(currentSnapshot);
+        }
         InternalDataFile irDataFile = fromIceberg(file, partitionSpec, irTable);
         irFiles.add(irDataFile);
       }
@@ -186,6 +215,9 @@ public class IcebergConversionSource implements ConversionSource<Snapshot> {
     Table iceTable = getSourceTable();
     PartitionSpec partitionSpec = iceTable.spec();
     InternalTable irTable = getTable(snapshot);
+    if (snapshot.addedDeleteFiles(fileIO).iterator().hasNext()) {
+      throw deleteFilesNotSupported(snapshot);
+    }
 
     Set<InternalDataFile> dataFilesAdded =
         StreamSupport.stream(snapshot.addedDataFiles(fileIO).spliterator(), false)
@@ -209,6 +241,50 @@ public class IcebergConversionSource implements ConversionSource<Snapshot> {
         .filesDiff(filesDiff)
         .sourceIdentifier(getCommitIdentifier(snapshot))
         .build();
+  }
+
+  // Delta and Hudi targets resolve columns by name and read every data file with the current
+  // column types. A renamed column would read as null in files written before the rename, and a
+  // promoted type (int to long, float to double, wider decimal) cannot be read from older files,
+  // so fail instead of producing such a table.
+  private static void checkSchemaHistory(Table table) {
+    Map<Integer, String> names = new HashMap<>();
+    Map<Integer, Type> types = new HashMap<>();
+    for (Schema schema : table.schemas().values()) {
+      for (Map.Entry<Integer, String> field :
+          TypeUtil.indexNameById(schema.asStruct()).entrySet()) {
+        String name = names.putIfAbsent(field.getKey(), field.getValue());
+        if (name != null && !name.equals(field.getValue())) {
+          throw new NotSupportedException(
+              String.format(
+                  "Column %s was renamed to %s (field id %d); targets that resolve columns by name"
+                      + " would read it as null in data files written before the rename",
+                  name, field.getValue(), field.getKey()));
+        }
+        Type type = schema.findType(field.getKey());
+        if (type.isPrimitiveType()) {
+          Type previous = types.putIfAbsent(field.getKey(), type);
+          if (previous != null && !previous.equals(type)) {
+            throw new NotSupportedException(
+                String.format(
+                    "Column %s changed type from %s to %s; data files written before the change"
+                        + " cannot be read with the new type",
+                    field.getValue(), previous, type));
+          }
+        }
+      }
+    }
+  }
+
+  // Position and equality delete files are not converted: a target built from the data files
+  // alone would still return the deleted rows, so fail instead of syncing them.
+  private static NotSupportedException deleteFilesNotSupported(Snapshot snapshot) {
+    return new NotSupportedException(
+        String.format(
+            "Snapshot %d has Iceberg delete files (merge-on-read deletes or updates), which cannot be"
+                + " converted; rewrite them first, e.g. with rewrite_data_files and"
+                + " delete-file-threshold=1",
+            snapshot.snapshotId()));
   }
 
   @Override

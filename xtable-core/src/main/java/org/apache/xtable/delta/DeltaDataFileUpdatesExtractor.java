@@ -20,7 +20,10 @@ package org.apache.xtable.delta;
 
 import static org.apache.xtable.delta.ScalaUtils.convertJavaMapToScala;
 
-import java.util.*;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -44,7 +47,6 @@ import org.apache.xtable.model.storage.InternalDataFile;
 import org.apache.xtable.model.storage.InternalFile;
 import org.apache.xtable.model.storage.InternalFilesDiff;
 import org.apache.xtable.model.storage.PartitionFileGroup;
-import org.apache.xtable.paths.PathUtils;
 
 @Builder
 public class DeltaDataFileUpdatesExtractor {
@@ -113,9 +115,7 @@ public class DeltaDataFileUpdatesExtractor {
       InternalDataFile dataFile, InternalSchema schema, String tableBasePath) {
     return Stream.of(
         new AddFile(
-            // Delta Lake supports relative and absolute paths in theory but relative paths seem
-            // more commonly supported by query engines in our testing
-            PathUtils.getRelativePath(dataFile.getPhysicalPath(), tableBasePath),
+            DeltaPathUtils.getPathForDeltaLog(tableBasePath, dataFile.getPhysicalPath()),
             convertJavaMapToScala(deltaPartitionExtractor.partitionValueSerialization(dataFile)),
             dataFile.getFileSizeBytes(),
             dataFile.getLastModified(),

@@ -18,17 +18,38 @@
  
 package org.apache.xtable.iceberg;
 
-import java.util.*;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
+import lombok.AccessLevel;
 import lombok.AllArgsConstructor;
 
-import org.apache.iceberg.*;
+import org.apache.iceberg.AppendFiles;
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.ManifestFiles;
+import org.apache.iceberg.ManifestWriter;
+import org.apache.iceberg.OverwriteFiles;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.TableOperations;
+import org.apache.iceberg.Transaction;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.OutputFile;
 
 import org.apache.xtable.exception.NotSupportedException;
 import org.apache.xtable.exception.ReadException;
+import org.apache.xtable.exception.UpdateException;
 import org.apache.xtable.model.InternalTable;
 import org.apache.xtable.model.metadata.TableSyncMetadata;
 import org.apache.xtable.model.storage.FilesDiff;
@@ -37,10 +58,24 @@ import org.apache.xtable.model.storage.InternalFile;
 import org.apache.xtable.model.storage.InternalFilesDiff;
 import org.apache.xtable.model.storage.PartitionFileGroup;
 
-@AllArgsConstructor(staticName = "of")
+@AllArgsConstructor(access = AccessLevel.PACKAGE)
 public class IcebergDataFileUpdatesSync {
+  // When positive, a sync that only adds files writes them into manifests of this many files each
+  // instead of holding every Iceberg data file until the commit (-1: disabled). Bounds memory for
+  // the first full sync of a table with millions of files.
+  private static final int MANIFEST_BATCH_SIZE =
+      Integer.getInteger("xtable.iceberg.manifestBatchSize", -1);
+
   private final IcebergColumnStatsConverter columnStatsConverter;
   private final IcebergPartitionValueConverter partitionValueConverter;
+  private final int manifestBatchSize;
+
+  public static IcebergDataFileUpdatesSync of(
+      IcebergColumnStatsConverter columnStatsConverter,
+      IcebergPartitionValueConverter partitionValueConverter) {
+    return new IcebergDataFileUpdatesSync(
+        columnStatsConverter, partitionValueConverter, MANIFEST_BATCH_SIZE);
+  }
 
   public void applySnapshot(
       Table table,
@@ -95,6 +130,10 @@ public class IcebergDataFileUpdatesSync {
       Schema schema,
       PartitionSpec partitionSpec,
       TableSyncMetadata metadata) {
+    if (manifestBatchSize > 0 && filesRemoved.isEmpty()) {
+      appendInManifestBatches(transaction, filesAdded, schema, partitionSpec, metadata);
+      return;
+    }
     OverwriteFiles overwriteFiles = transaction.newOverwrite();
     filesAdded.stream()
         .filter(InternalDataFile.class::isInstance)
@@ -103,6 +142,56 @@ public class IcebergDataFileUpdatesSync {
     filesRemoved.forEach(overwriteFiles::deleteFile);
     overwriteFiles.set(TableSyncMetadata.XTABLE_METADATA, metadata.toJson());
     overwriteFiles.commit();
+  }
+
+  /**
+   * Writes the added files into manifests of at most {@code manifestBatchSize} files each and
+   * appends the manifests, so only one batch of Iceberg data files is held in memory at a time.
+   */
+  private void appendInManifestBatches(
+      Transaction transaction,
+      Collection<? extends InternalFile> filesAdded,
+      Schema schema,
+      PartitionSpec partitionSpec,
+      TableSyncMetadata metadata) {
+    TableOperations operations = ((HasTableOperations) transaction.table()).operations();
+    int formatVersion = operations.current().formatVersion();
+    String manifestPrefix = UUID.randomUUID() + "-xtable-m";
+    AppendFiles appendFiles = transaction.newFastAppend();
+    ManifestWriter<DataFile> writer = null;
+    int manifestCount = 0;
+    int filesInManifest = 0;
+    try {
+      for (InternalFile file : filesAdded) {
+        if (!(file instanceof InternalDataFile)) {
+          continue;
+        }
+        if (writer == null) {
+          OutputFile outputFile =
+              operations
+                  .io()
+                  .newOutputFile(
+                      operations.metadataFileLocation(
+                          FileFormat.AVRO.addExtension(manifestPrefix + manifestCount++)));
+          writer = ManifestFiles.write(formatVersion, partitionSpec, outputFile, null);
+        }
+        writer.add(getDataFile(partitionSpec, schema, (InternalDataFile) file));
+        if (++filesInManifest >= manifestBatchSize) {
+          writer.close();
+          appendFiles.appendManifest(writer.toManifestFile());
+          writer = null;
+          filesInManifest = 0;
+        }
+      }
+      if (writer != null) {
+        writer.close();
+        appendFiles.appendManifest(writer.toManifestFile());
+      }
+    } catch (IOException e) {
+      throw new UpdateException("Failed to write Iceberg manifest", e);
+    }
+    appendFiles.set(TableSyncMetadata.XTABLE_METADATA, metadata.toJson());
+    appendFiles.commit();
   }
 
   private DataFile getDataFile(

@@ -18,6 +18,8 @@
  
 package org.apache.xtable.hudi;
 
+import static org.apache.hudi.metadata.HoodieTableMetadataUtil.PARTITION_NAME_COLUMN_STATS;
+import static org.apache.hudi.metadata.HoodieTableMetadataUtil.existingIndexVersionOrDefault;
 import static org.apache.xtable.hudi.HudiSchemaExtractor.convertFromXTablePath;
 
 import java.util.ArrayList;
@@ -35,29 +37,40 @@ import java.util.stream.Collectors;
 import lombok.AllArgsConstructor;
 import lombok.NonNull;
 import lombok.Value;
+import lombok.extern.slf4j.Slf4j;
 
 import org.apache.hadoop.fs.Path;
 
 import org.apache.hudi.client.WriteStatus;
+import org.apache.hudi.common.config.HoodieCommonConfig;
 import org.apache.hudi.common.config.HoodieMetadataConfig;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.HoodieBaseFile;
-import org.apache.hudi.common.model.HoodieColumnRangeMetadata;
 import org.apache.hudi.common.model.HoodieDeltaWriteStat;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
-import org.apache.hudi.common.table.view.HoodieTableFileSystemView;
+import org.apache.hudi.common.table.view.FileSystemViewManager;
+import org.apache.hudi.common.table.view.FileSystemViewStorageConfig;
+import org.apache.hudi.common.table.view.FileSystemViewStorageType;
+import org.apache.hudi.common.table.view.SyncableFileSystemView;
 import org.apache.hudi.common.util.ExternalFilePathUtil;
-import org.apache.hudi.hadoop.CachingPath;
-import org.apache.hudi.metadata.HoodieMetadataFileSystemView;
+import org.apache.hudi.hadoop.fs.CachingPath;
+import org.apache.hudi.metadata.HoodieIndexVersion;
+import org.apache.hudi.metadata.HoodieTableMetadata;
+import org.apache.hudi.metadata.MetadataPartitionType;
+import org.apache.hudi.stats.HoodieColumnRangeMetadata;
+import org.apache.hudi.stats.ValueMetadata;
+import org.apache.hudi.stats.XTableValueMetadata;
 
 import org.apache.xtable.collectors.CustomCollectors;
+import org.apache.xtable.exception.ReadException;
 import org.apache.xtable.model.schema.InternalType;
 import org.apache.xtable.model.stat.ColumnStat;
 import org.apache.xtable.model.storage.InternalDataFile;
 import org.apache.xtable.model.storage.InternalFilesDiff;
 import org.apache.xtable.model.storage.PartitionFileGroup;
 
+@Slf4j
 @AllArgsConstructor(staticName = "of")
 public class BaseFileUpdatesExtractor {
   private static final Pattern HUDI_BASE_FILE_PATTERN =
@@ -82,16 +95,65 @@ public class BaseFileUpdatesExtractor {
         HoodieMetadataConfig.newBuilder()
             .enable(metaClient.getTableConfig().isMetadataTableAvailable())
             .build();
-    HoodieTableFileSystemView fsView =
-        new HoodieMetadataFileSystemView(
-            engineContext, metaClient, metaClient.getActiveTimeline(), metadataConfig);
+    HoodieTableMetadata tableMetadata =
+        metadataConfig.isEnabled()
+            ? metaClient
+                .getTableFormat()
+                .getMetadataFactory()
+                .create(
+                    engineContext,
+                    metaClient.getStorage(),
+                    metadataConfig,
+                    tableBasePath.toString())
+            : null;
+    FileSystemViewManager fileSystemViewManager =
+        FileSystemViewManager.createViewManager(
+            engineContext,
+            metadataConfig,
+            FileSystemViewStorageConfig.newBuilder()
+                .withStorageType(FileSystemViewStorageType.MEMORY)
+                .build(),
+            HoodieCommonConfig.newBuilder().build(),
+            meta -> tableMetadata);
+    try (SyncableFileSystemView fsView = fileSystemViewManager.getFileSystemView(metaClient)) {
+      return extractFromFsView(partitionedDataFiles, commit, fsView, metaClient, metadataConfig);
+    } catch (Exception ex) {
+      throw new ReadException(
+          "Failed to extract snapshot changes for Hudi table at " + tableBasePath, ex);
+    } finally {
+      try {
+        fileSystemViewManager.close();
+        if (tableMetadata != null) {
+          tableMetadata.close();
+        }
+      } catch (Exception ex) {
+        log.warn(
+            "Failed to close file system view resources for Hudi table at {}", tableBasePath, ex);
+      }
+    }
+  }
+
+  ReplaceMetadata extractFromFsView(
+      List<PartitionFileGroup> partitionedDataFiles,
+      String commit,
+      SyncableFileSystemView fsView,
+      HoodieTableMetaClient metaClient,
+      HoodieMetadataConfig metadataConfig) {
     boolean isTableInitialized = metaClient.isTimelineNonEmpty();
+    // Hudi builds the column-stats index for existing files from the metadata table's file listing,
+    // which skips externally created files. When the index is missing, register every snapshot file
+    // again, so the index gets the stats of all files from this commit's write stats.
+    boolean reregisterExistingFiles =
+        isTableInitialized
+            && !metaClient
+                .getTableConfig()
+                .isMetadataPartitionAvailable(MetadataPartitionType.COLUMN_STATS);
     // Track the partitions that are not present in the snapshot, so the files for those partitions
     // can be dropped
+    HoodieIndexVersion indexVersion =
+        existingIndexVersionOrDefault(PARTITION_NAME_COLUMN_STATS, metaClient);
     Set<String> partitionPathsToDrop =
-        new HashSet<>(
-            FSUtils.getAllPartitionPaths(
-                engineContext, metadataConfig, metaClient.getBasePathV2().toString()));
+        new HashSet<>(FSUtils.getAllPartitionPaths(engineContext, metaClient, metadataConfig));
     ReplaceMetadata replaceMetadata =
         partitionedDataFiles.stream()
             .map(
@@ -114,18 +176,15 @@ public class BaseFileUpdatesExtractor {
                           : Collections.emptyList();
                   Set<String> existingPaths =
                       baseFiles.stream().map(HoodieBaseFile::getPath).collect(Collectors.toSet());
-                  // Mark fileIds for removal if the file paths are no longer present in the
-                  // snapshot
-                  List<String> fileIdsToRemove =
-                      baseFiles.stream()
-                          .filter(baseFile -> !physicalPathToFile.containsKey(baseFile.getPath()))
-                          .map(HoodieBaseFile::getFileId)
-                          .collect(Collectors.toList());
                   // for any entries in the map that are not in the set of existing paths, create a
-                  // write status to add them to the Hudi table
+                  // write status to add them to the Hudi table; an existing file gets a new file
+                  // slice in its file group when it is registered again
                   List<WriteStatus> writeStatuses =
                       physicalPathToFile.entrySet().stream()
-                          .filter(entry -> !existingPaths.contains(entry.getKey()))
+                          .filter(
+                              entry ->
+                                  reregisterExistingFiles
+                                      || !existingPaths.contains(entry.getKey()))
                           .map(Map.Entry::getValue)
                           .map(
                               snapshotFile ->
@@ -133,7 +192,21 @@ public class BaseFileUpdatesExtractor {
                                       tableBasePath,
                                       commit,
                                       snapshotFile,
-                                      Optional.of(partitionPath)))
+                                      Optional.of(partitionPath),
+                                      indexVersion))
+                          .collect(Collectors.toList());
+                  // Mark fileIds for removal if the file paths are no longer present in the
+                  // snapshot. A fileId that this commit writes is never replaced, because Hudi
+                  // hides every file slice of a replaced file group.
+                  Set<String> writtenFileIds =
+                      writeStatuses.stream()
+                          .map(WriteStatus::getFileId)
+                          .collect(Collectors.toSet());
+                  List<String> fileIdsToRemove =
+                      baseFiles.stream()
+                          .filter(baseFile -> !physicalPathToFile.containsKey(baseFile.getPath()))
+                          .map(HoodieBaseFile::getFileId)
+                          .filter(fileId -> !writtenFileIds.contains(fileId))
                           .collect(Collectors.toList());
                   return ReplaceMetadata.of(
                       fileIdsToRemove.isEmpty()
@@ -167,35 +240,62 @@ public class BaseFileUpdatesExtractor {
    *
    * @param internalFilesDiff the diff to apply to the Hudi table
    * @param commit The current commit started by the Hudi client
+   * @param indexVersion the Hudi index version
    * @return The information needed to create a "replace" commit for the Hudi table
    */
   ReplaceMetadata convertDiff(
-      @NonNull InternalFilesDiff internalFilesDiff, @NonNull String commit) {
+      @NonNull InternalFilesDiff internalFilesDiff,
+      @NonNull String commit,
+      @NonNull HoodieIndexVersion indexVersion) {
     // For all removed files, group by partition and extract the file id
     Map<String, List<String>> partitionToReplacedFileIds =
         internalFilesDiff.dataFilesRemoved().stream()
-            .map(file -> new CachingPath(file.getPhysicalPath()))
             .collect(
                 Collectors.groupingBy(
-                    path -> HudiPathUtils.getPartitionPath(tableBasePath, path),
+                    file -> getHudiPartitionPath(tableBasePath, file),
                     Collectors.mapping(this::getFileId, Collectors.toList())));
     // For all added files, group by partition and extract the file id
     List<WriteStatus> writeStatuses =
         internalFilesDiff.dataFilesAdded().stream()
-            .map(file -> toWriteStatus(tableBasePath, commit, file, Optional.empty()))
+            .map(file -> toWriteStatus(tableBasePath, commit, file, Optional.empty(), indexVersion))
             .collect(CustomCollectors.toList(internalFilesDiff.dataFilesAdded().size()));
     return ReplaceMetadata.of(partitionToReplacedFileIds, writeStatuses);
   }
 
-  private String getFileId(Path filePath) {
-    String fileName = filePath.getName();
+  private String getFileId(InternalDataFile file) {
+    String fileName = new CachingPath(file.getPhysicalPath()).getName();
     // if file was created by Hudi use original fileId, otherwise use the file name as IDs
     if (isFileCreatedByHudiWriter(fileName)) {
       return FSUtils.getFileId(fileName);
     }
-    return fileName;
+    // Files under a partition subdirectory keep it as part of the fileId so the subdirectory can be
+    // recovered when Hudi resolves the physical path of the externally created file.
+    return file.getPartitionSubdirectory().map(prefix -> prefix + "/" + fileName).orElse(fileName);
   }
 
+  /**
+   * Resolves the Hudi partition path for a file. A partition subdirectory (e.g. Paimon's {@code
+   * bucket-N}) is a file group within the partition (see Hudi PR #17788), so it is stripped from
+   * the partition path.
+   */
+  private String getHudiPartitionPath(Path tableBasePath, InternalDataFile file) {
+    String partitionPath =
+        HudiPathUtils.getPartitionPath(tableBasePath, new CachingPath(file.getPhysicalPath()));
+    return file.getPartitionSubdirectory()
+        .map(
+            prefix -> {
+              if (!partitionPath.endsWith(prefix)) {
+                throw new IllegalArgumentException(
+                    String.format(
+                        "File %s is not under its partition subdirectory %s",
+                        file.getPhysicalPath(), prefix));
+              }
+              return prefix.equals(partitionPath)
+                  ? ""
+                  : partitionPath.substring(0, partitionPath.length() - prefix.length() - 1);
+            })
+        .orElse(partitionPath);
+  }
   /**
    * Checks if the file was created by Hudi. Assumes Hudi is creating files with the default fileId
    * length and format
@@ -211,48 +311,70 @@ public class BaseFileUpdatesExtractor {
       Path tableBasePath,
       String commitTime,
       InternalDataFile file,
-      Optional<String> partitionPathOptional) {
+      Optional<String> partitionPathOptional,
+      HoodieIndexVersion indexVersion) {
     WriteStatus writeStatus = new WriteStatus();
     Path path = new CachingPath(file.getPhysicalPath());
     String partitionPath =
-        partitionPathOptional.orElseGet(() -> HudiPathUtils.getPartitionPath(tableBasePath, path));
-    String fileId = getFileId(path);
+        partitionPathOptional.orElseGet(() -> getHudiPartitionPath(tableBasePath, file));
+    String fileId = getFileId(file);
     String filePath =
         path.toUri().getPath().substring(tableBasePath.toUri().getPath().length() + 1);
     String fileName = path.getName();
+    Optional<String> partitionSubdirectory = file.getPartitionSubdirectory();
+    // For files under a partition subdirectory, encode it as the file-group prefix in the marker
+    // and keep the file name (not the bucket-relative path) as the marked name. Otherwise, fall
+    // back to the plain marker on the full relative path. In both cases the directory portion is
+    // preserved as-is.
+    String markedPath =
+        partitionSubdirectory
+            .map(
+                prefix ->
+                    filePath.substring(0, filePath.length() - fileName.length())
+                        + ExternalFilePathUtil.appendCommitTimeAndExternalFileMarker(
+                            fileName, commitTime, prefix))
+            .orElseGet(
+                () ->
+                    ExternalFilePathUtil.appendCommitTimeAndExternalFileMarker(
+                        filePath, commitTime));
     writeStatus.setFileId(fileId);
     writeStatus.setPartitionPath(partitionPath);
     HoodieDeltaWriteStat writeStat = new HoodieDeltaWriteStat();
     writeStat.setFileId(fileId);
-    writeStat.setPath(
-        ExternalFilePathUtil.appendCommitTimeAndExternalFileMarker(filePath, commitTime));
+    writeStat.setPath(markedPath);
     writeStat.setPartitionPath(partitionPath);
     writeStat.setNumWrites(file.getRecordCount());
     writeStat.setTotalWriteBytes(file.getFileSizeBytes());
     writeStat.setFileSizeInBytes(file.getFileSizeBytes());
-    writeStat.putRecordsStats(convertColStats(fileName, file.getColumnStats()));
+    writeStat.setNumInserts(file.getRecordCount());
+    writeStat.putRecordsStats(convertColStats(fileName, file.getColumnStats(), indexVersion));
     writeStatus.setStat(writeStat);
     return writeStatus;
   }
 
   private Map<String, HoodieColumnRangeMetadata<Comparable>> convertColStats(
-      String fileName, List<ColumnStat> columnStatMap) {
+      String fileName, List<ColumnStat> columnStatMap, HoodieIndexVersion indexVersion) {
     return columnStatMap.stream()
         .filter(
             entry ->
                 !InternalType.NON_SCALAR_TYPES.contains(entry.getField().getSchema().getDataType()))
         .map(
-            columnStat ->
-                HoodieColumnRangeMetadata.<Comparable>create(
-                    fileName,
-                    convertFromXTablePath(columnStat.getField().getPath()),
-                    (Comparable) columnStat.getRange().getMinValue(),
-                    (Comparable) columnStat.getRange().getMaxValue(),
-                    columnStat.getNumNulls(),
-                    columnStat.getNumValues(),
-                    columnStat.getTotalSize(),
-                    -1L))
-        .collect(Collectors.toMap(HoodieColumnRangeMetadata::getColumnName, metadata -> metadata));
+            columnStat -> {
+              ValueMetadata valueMetadata =
+                  XTableValueMetadata.getValueMetadata(columnStat, indexVersion);
+              return HoodieColumnRangeMetadata.<Comparable>create(
+                  fileName,
+                  convertFromXTablePath(columnStat.getField().getPath()),
+                  valueMetadata.standardizeJavaTypeAndPromote(columnStat.getRange().getMinValue()),
+                  valueMetadata.standardizeJavaTypeAndPromote(columnStat.getRange().getMaxValue()),
+                  columnStat.getNumNulls(),
+                  columnStat.getNumValues(),
+                  columnStat.getTotalSize(),
+                  -1L,
+                  valueMetadata);
+            })
+        .collect(
+            Collectors.toMap(HoodieColumnRangeMetadata::getColumnName, columnStat -> columnStat));
   }
 
   /** Holds the information needed to create a "replace" commit in the Hudi table. */
@@ -275,7 +397,6 @@ public class BaseFileUpdatesExtractor {
   }
 
   private String getPartitionPath(Path tableBasePath, List<InternalDataFile> files) {
-    return HudiPathUtils.getPartitionPath(
-        tableBasePath, new CachingPath(files.get(0).getPhysicalPath()));
+    return getHudiPartitionPath(tableBasePath, files.get(0));
   }
 }

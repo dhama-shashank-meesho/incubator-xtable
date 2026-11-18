@@ -130,7 +130,7 @@ public class TestDeltaValueConverter {
                         InternalSchema.MetadataKey.TIMESTAMP_PRECISION,
                         InternalSchema.MetadataValue.MILLIS))
                 .build(),
-            "2022-10-08 21:08:17"),
+            "2022-10-08T21:08:17.000Z"),
         Arguments.of(
             1665263297000000L,
             InternalSchema.builder()
@@ -141,7 +141,7 @@ public class TestDeltaValueConverter {
                         InternalSchema.MetadataKey.TIMESTAMP_PRECISION,
                         InternalSchema.MetadataValue.MICROS))
                 .build(),
-            "2022-10-08 21:08:17"),
+            "2022-10-08T21:08:17.000Z"),
         Arguments.of(
             1665263297000L,
             InternalSchema.builder()
@@ -152,7 +152,7 @@ public class TestDeltaValueConverter {
                         InternalSchema.MetadataKey.TIMESTAMP_PRECISION,
                         InternalSchema.MetadataValue.MILLIS))
                 .build(),
-            "2022-10-08 21:08:17"),
+            "2022-10-08T21:08:17.000"),
         Arguments.of(
             1665263297000000L,
             InternalSchema.builder()
@@ -163,7 +163,7 @@ public class TestDeltaValueConverter {
                         InternalSchema.MetadataKey.TIMESTAMP_PRECISION,
                         InternalSchema.MetadataValue.MICROS))
                 .build(),
-            "2022-10-08 21:08:17"));
+            "2022-10-08T21:08:17.000"));
   }
 
   private static Stream<Arguments> valuesWithSchemaProviderForPartitions() {
@@ -218,6 +218,55 @@ public class TestDeltaValueConverter {
         Arguments.of("+Infinity", floatSchema, Float.POSITIVE_INFINITY),
         Arguments.of(Double.NaN, doubleSchema, Double.NaN),
         Arguments.of(Double.POSITIVE_INFINITY, doubleSchema, Double.POSITIVE_INFINITY));
+  }
+
+  @Test
+  void timestampStatsKeepMillisecondsAndOffset() {
+    InternalSchema timestamp =
+        InternalSchema.builder()
+            .name("ts")
+            .dataType(InternalType.TIMESTAMP)
+            .metadata(
+                Collections.singletonMap(
+                    InternalSchema.MetadataKey.TIMESTAMP_PRECISION,
+                    InternalSchema.MetadataValue.MICROS))
+            .build();
+    InternalSchema timestampNtz =
+        timestamp.toBuilder().dataType(InternalType.TIMESTAMP_NTZ).build();
+    // micros are truncated to the millisecond precision Delta stats use
+    assertEquals(
+        "2022-10-08T21:08:17.123Z",
+        DeltaValueConverter.convertToDeltaColumnStatValue(1665263297123456L, timestamp));
+    assertEquals(
+        "2022-10-08T21:08:17.123",
+        DeltaValueConverter.convertToDeltaColumnStatValue(1665263297123456L, timestampNtz));
+  }
+
+  @ParameterizedTest
+  @MethodSource("timestampStatsAsWritten")
+  void parsesTimestampStatsAsWrittenByDeltaAndOlderXTable(String deltaValue, InternalType type) {
+    InternalSchema schema =
+        InternalSchema.builder()
+            .name("ts")
+            .dataType(type)
+            .metadata(
+                Collections.singletonMap(
+                    InternalSchema.MetadataKey.TIMESTAMP_PRECISION,
+                    InternalSchema.MetadataValue.MICROS))
+            .build();
+    assertEquals(
+        1665263297000000L, DeltaValueConverter.convertFromDeltaColumnStatValue(deltaValue, schema));
+  }
+
+  private static Stream<Arguments> timestampStatsAsWritten() {
+    return Stream.of(
+        // Delta TIMESTAMP stats carry the writer's offset
+        Arguments.of("2022-10-09T02:38:17.000+05:30", InternalType.TIMESTAMP),
+        Arguments.of("2022-10-08T21:08:17.000Z", InternalType.TIMESTAMP),
+        // Delta TIMESTAMP_NTZ stats have no offset
+        Arguments.of("2022-10-08T21:08:17.000", InternalType.TIMESTAMP_NTZ),
+        // older XTable versions wrote this format
+        Arguments.of("2022-10-08 21:08:17", InternalType.TIMESTAMP));
   }
 
   @ParameterizedTest

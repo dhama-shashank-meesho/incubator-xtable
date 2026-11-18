@@ -23,14 +23,18 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import lombok.Builder;
 import lombok.Value;
+import lombok.extern.log4j.Log4j2;
 
 import org.apache.hadoop.fs.Path;
 
@@ -50,12 +54,12 @@ import org.apache.hudi.common.model.HoodieWriteStat;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
-import org.apache.hudi.common.table.timeline.TimelineMetadataUtils;
 import org.apache.hudi.common.table.view.FileSystemViewManager;
 import org.apache.hudi.common.table.view.FileSystemViewStorageConfig;
 import org.apache.hudi.common.table.view.FileSystemViewStorageType;
 import org.apache.hudi.common.table.view.SyncableFileSystemView;
 import org.apache.hudi.common.table.view.TableFileSystemView;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.metadata.HoodieTableMetadata;
 
 import org.apache.xtable.collectors.CustomCollectors;
@@ -71,6 +75,7 @@ import org.apache.xtable.model.storage.InternalFilesDiff;
 import org.apache.xtable.model.storage.PartitionFileGroup;
 
 /** Extracts all the files for Hudi table represented by {@link InternalTable}. */
+@Log4j2
 public class HudiDataFileExtractor implements AutoCloseable {
   private final HoodieTableMetadata tableMetadata;
   private final HoodieTableMetaClient metaClient;
@@ -80,20 +85,27 @@ public class HudiDataFileExtractor implements AutoCloseable {
   private final HoodieMetadataConfig metadataConfig;
   private final FileSystemViewManager fileSystemViewManager;
   private final Path basePath;
+  // Previous-commit metadata read to recover cleaned files, keyed by instant time. The extractor
+  // lives for a single sync, so each instant is read at most once per sync.
+  private final Map<String, Optional<HoodieCommitMetadata>> prevCommitMetadataCache =
+      new HashMap<>();
 
   public HudiDataFileExtractor(
       HoodieTableMetaClient metaClient,
       PathBasedPartitionValuesExtractor hudiPartitionValuesExtractor,
       HudiFileStatsExtractor hudiFileStatsExtractor) {
-    this.engineContext = new HoodieLocalEngineContext(metaClient.getHadoopConf());
+    this.engineContext = new HoodieLocalEngineContext(metaClient.getStorageConf());
     metadataConfig =
         HoodieMetadataConfig.newBuilder()
             .enable(metaClient.getTableConfig().isMetadataTableAvailable())
             .build();
-    this.basePath = metaClient.getBasePathV2();
+    this.basePath = HadoopFSUtils.convertToHadoopPath(metaClient.getBasePath());
     this.tableMetadata =
-        metadataConfig.enabled()
-            ? HoodieTableMetadata.create(engineContext, metadataConfig, basePath.toString(), true)
+        metadataConfig.isEnabled()
+            ? metaClient
+                .getTableFormat()
+                .getMetadataFactory()
+                .create(engineContext, metaClient.getStorage(), metadataConfig, basePath.toString())
             : null;
     this.fileSystemViewManager =
         FileSystemViewManager.createViewManager(
@@ -114,7 +126,7 @@ public class HudiDataFileExtractor implements AutoCloseable {
       List<String> allPartitionPaths =
           tableMetadata != null
               ? tableMetadata.getAllPartitionPaths()
-              : FSUtils.getAllPartitionPaths(engineContext, metadataConfig, basePath.toString());
+              : FSUtils.getAllPartitionPaths(engineContext, metaClient, metadataConfig);
       return getInternalDataFilesForPartitions(allPartitionPaths, table);
     } catch (IOException ex) {
       throw new ReadException(
@@ -154,33 +166,31 @@ public class HudiDataFileExtractor implements AutoCloseable {
       switch (instant.getAction()) {
         case HoodieTimeline.COMMIT_ACTION:
         case HoodieTimeline.DELTA_COMMIT_ACTION:
-          HoodieCommitMetadata commitMetadata =
-              HoodieCommitMetadata.fromBytes(
-                  timeline.getInstantDetails(instant).get(), HoodieCommitMetadata.class);
+          HoodieCommitMetadata commitMetadata = timeline.readCommitMetadata(instant);
+          // pre-load all partitions to cut down on repeated reads if Hudi Metadata is enabled
+          fsView.loadPartitions(
+              new ArrayList<>(commitMetadata.getPartitionToWriteStats().keySet()));
           commitMetadata
               .getPartitionToWriteStats()
               .forEach(
                   (partitionPath, writeStats) -> {
-                    Set<String> affectedFileIds =
-                        writeStats.stream()
-                            .map(HoodieWriteStat::getFileId)
-                            .collect(Collectors.toSet());
                     AddedAndRemovedFiles addedAndRemovedFiles =
                         getUpdatesToPartition(
                             fsView,
+                            timeline,
                             instantToConsider,
                             partitionPath,
-                            affectedFileIds,
+                            writeStats,
                             partitioningFields);
                     addedFiles.addAll(addedAndRemovedFiles.getAdded());
                     removedFiles.addAll(addedAndRemovedFiles.getRemoved());
                   });
           break;
         case HoodieTimeline.REPLACE_COMMIT_ACTION:
-          HoodieReplaceCommitMetadata replaceMetadata =
-              HoodieReplaceCommitMetadata.fromBytes(
-                  timeline.getInstantDetails(instant).get(), HoodieReplaceCommitMetadata.class);
-
+          HoodieReplaceCommitMetadata replaceMetadata = timeline.readReplaceCommitMetadata(instant);
+          // pre-load all partitions to cut down on repeated reads if Hudi Metadata is enabled
+          fsView.loadPartitions(
+              new ArrayList<>(replaceMetadata.getPartitionToReplaceFileIds().keySet()));
           replaceMetadata
               .getPartitionToReplaceFileIds()
               .forEach(
@@ -207,8 +217,7 @@ public class HudiDataFileExtractor implements AutoCloseable {
           break;
         case HoodieTimeline.ROLLBACK_ACTION:
           HoodieRollbackMetadata rollbackMetadata =
-              TimelineMetadataUtils.deserializeAvroMetadata(
-                  timeline.getInstantDetails(instant).get(), HoodieRollbackMetadata.class);
+              metaClient.getActiveTimeline().readRollbackMetadata(instant);
           rollbackMetadata
               .getPartitionMetadata()
               .forEach(
@@ -219,8 +228,7 @@ public class HudiDataFileExtractor implements AutoCloseable {
           break;
         case HoodieTimeline.RESTORE_ACTION:
           HoodieRestoreMetadata restoreMetadata =
-              TimelineMetadataUtils.deserializeAvroMetadata(
-                  timeline.getInstantDetails(instant).get(), HoodieRestoreMetadata.class);
+              metaClient.getActiveTimeline().readRestoreMetadata(instant);
           restoreMetadata
               .getHoodieRestoreMetadata()
               .forEach(
@@ -280,10 +288,26 @@ public class HudiDataFileExtractor implements AutoCloseable {
 
   private AddedAndRemovedFiles getUpdatesToPartition(
       TableFileSystemView fsView,
+      HoodieTimeline timeline,
       HoodieInstant instantToConsider,
       String partitionPath,
-      Set<String> affectedFileIds,
+      List<HoodieWriteStat> writeStats,
       List<InternalPartitionField> partitioningFields) {
+    Set<String> affectedFileIds =
+        writeStats.stream().map(HoodieWriteStat::getFileId).collect(Collectors.toSet());
+    // Build a map from fileId → prevCommit for file groups that are UPSERTs (not brand-new).
+    // Used below to recover the old file path when CLEAN has already deleted it from the FS.
+    Map<String, String> fileIdToPrevCommit =
+        writeStats.stream()
+            .filter(
+                ws ->
+                    ws.getPrevCommit() != null
+                        && !HoodieTimeline.INIT_INSTANT_TS.equals(ws.getPrevCommit()))
+            .collect(
+                Collectors.toMap(
+                    HoodieWriteStat::getFileId,
+                    HoodieWriteStat::getPrevCommit,
+                    (existing, replacement) -> existing));
     List<InternalDataFile> filesToAdd = new ArrayList<>(affectedFileIds.size());
     List<InternalDataFile> filesToRemove = new ArrayList<>(affectedFileIds.size());
     List<PartitionValue> partitionValues =
@@ -298,19 +322,76 @@ public class HudiDataFileExtractor implements AutoCloseable {
               List<HoodieBaseFile> baseFiles =
                   fileGroup.getAllBaseFiles().collect(Collectors.toList());
               boolean newBaseFileAdded = false;
+              boolean removeEmitted = false;
               for (HoodieBaseFile baseFile : baseFiles) {
-                if (baseFile.getCommitTime().equals(instantToConsider.getTimestamp())) {
+                if (baseFile.getCommitTime().equals(instantToConsider.requestedTime())) {
                   newBaseFileAdded = true;
                   filesToAdd.add(buildFileWithoutStats(partitionValues, baseFile));
                 } else if (newBaseFileAdded) {
                   // if a new base file was added, then the previous base file for the group needs
                   // to be removed
                   filesToRemove.add(buildFileWithoutStats(partitionValues, baseFile));
+                  removeEmitted = true;
                   break;
+                }
+              }
+              // Recover old file path from timeline when CLEAN deleted it before this sync.
+              if (newBaseFileAdded && !removeEmitted) {
+                String fileId = fileGroup.getFileGroupId().getFileId();
+                String prevCommit = fileIdToPrevCommit.get(fileId);
+                if (prevCommit != null) {
+                  recoverRemovedFile(timeline, partitionPath, fileId, prevCommit, partitionValues)
+                      .ifPresent(filesToRemove::add);
                 }
               }
             });
     return AddedAndRemovedFiles.builder().added(filesToAdd).removed(filesToRemove).build();
+  }
+
+  /**
+   * Looks up the previous base file path from the timeline when CLEAN has already deleted it from
+   * storage, so the downstream format can emit a proper REMOVE for the stale file.
+   *
+   * @return the old {@link InternalDataFile}, or empty if the previous commit is no longer in the
+   *     visible timeline (e.g. archived before this sync ran)
+   */
+  Optional<InternalDataFile> recoverRemovedFile(
+      HoodieTimeline timeline,
+      String partitionPath,
+      String fileId,
+      String prevCommitTime,
+      List<PartitionValue> partitionValues) {
+    return prevCommitMetadataCache
+        .computeIfAbsent(prevCommitTime, commitTime -> readCommitMetadata(timeline, commitTime))
+        .flatMap(
+            prevMeta ->
+                prevMeta
+                    .getPartitionToWriteStats()
+                    .getOrDefault(partitionPath, Collections.emptyList())
+                    .stream()
+                    .filter(ws -> fileId.equals(ws.getFileId()))
+                    .findFirst()
+                    .map(
+                        ws ->
+                            buildFileWithoutStats(
+                                partitionValues, new HoodieBaseFile(ws.getPath()))));
+  }
+
+  private Optional<HoodieCommitMetadata> readCommitMetadata(
+      HoodieTimeline timeline, String commitTime) {
+    return timeline.getInstants().stream()
+        .filter(hoodieInstant -> commitTime.equals(hoodieInstant.requestedTime()))
+        .findFirst()
+        .flatMap(
+            instant -> {
+              try {
+                return Optional.of(timeline.readCommitMetadata(instant));
+              } catch (IOException e) {
+                log.warn(
+                    "Unable to read previous commit {} to recover removed files", commitTime, e);
+                return Optional.empty();
+              }
+            });
   }
 
   private AddedAndRemovedFiles getUpdatesToPartitionForReplaceCommit(
@@ -326,9 +407,7 @@ public class HudiDataFileExtractor implements AutoCloseable {
         partitionValuesExtractor.extractPartitionValues(partitioningFields, partitionPath);
     Stream<HoodieFileGroup> fileGroups =
         Stream.concat(
-            fsView.getAllFileGroups(partitionPath),
-            fsView.getReplacedFileGroupsBeforeOrOn(
-                instantToConsider.getTimestamp(), partitionPath));
+            fsView.getAllFileGroups(partitionPath), fsView.getAllReplacedFileGroups(partitionPath));
     fileGroups.forEach(
         fileGroup -> {
           List<HoodieBaseFile> baseFiles = fileGroup.getAllBaseFiles().collect(Collectors.toList());
@@ -347,6 +426,12 @@ public class HudiDataFileExtractor implements AutoCloseable {
       List<String> partitionPaths, InternalTable table) {
 
     SyncableFileSystemView fsView = fileSystemViewManager.getFileSystemView(metaClient);
+    // Batch-load all partitions in a single metadata table lookup before fanning out per
+    // partition below. Without this, the parallel stream below triggers one metadata table
+    // scan (and one S3 connection) per partition, which for tables with thousands of
+    // partitions causes S3 connection pool exhaustion and lock contention on the shared
+    // file system view.
+    fsView.loadPartitions(partitionPaths);
     Stream<InternalDataFile> filesWithoutStats =
         partitionPaths.stream()
             .parallel()
@@ -373,7 +458,8 @@ public class HudiDataFileExtractor implements AutoCloseable {
       fileSystemViewManager.close();
     } catch (Exception e) {
       throw new ReadException(
-          "Could not close table metadata for table " + metaClient.getTableConfig().getTableName());
+          "Could not close table metadata for table " + metaClient.getTableConfig().getTableName(),
+          e);
     }
   }
 
@@ -402,9 +488,9 @@ public class HudiDataFileExtractor implements AutoCloseable {
         .recordCount(rowCount)
         .columnStats(Collections.emptyList())
         .lastModified(
-            hoodieBaseFile.getFileStatus() == null
+            hoodieBaseFile.getPathInfo() == null
                 ? 0L
-                : hoodieBaseFile.getFileStatus().getModificationTime())
+                : hoodieBaseFile.getPathInfo().getModificationTime())
         .build();
   }
 

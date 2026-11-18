@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
@@ -52,6 +53,7 @@ import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 import lombok.SneakyThrows;
 
@@ -59,6 +61,8 @@ import org.apache.hadoop.conf.Configuration;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
@@ -67,6 +71,7 @@ import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Metrics;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.SnapshotSummary;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableScan;
 import org.apache.iceberg.Transaction;
@@ -99,6 +104,7 @@ import org.apache.xtable.model.storage.FileFormat;
 import org.apache.xtable.model.storage.InternalDataFile;
 import org.apache.xtable.model.storage.PartitionFileGroup;
 import org.apache.xtable.model.storage.TableFormat;
+import org.apache.xtable.model.sync.SyncResult;
 import org.apache.xtable.schema.SchemaFieldFinder;
 import org.apache.xtable.spi.sync.TableFormatSync;
 
@@ -106,6 +112,7 @@ import org.apache.xtable.spi.sync.TableFormatSync;
  * Validates that the metadata for the table is properly created/updated. {@link
  * ITConversionController} validates that the table and its data can be properly read.
  */
+@Execution(ExecutionMode.SAME_THREAD)
 public class TestIcebergSync {
   private static final Random RANDOM = new Random();
   private static final Instant LAST_COMMIT_TIME = Instant.ofEpochSecond(1000);
@@ -190,6 +197,13 @@ public class TestIcebergSync {
   }
 
   private IcebergConversionTarget getConversionTarget() {
+    return getConversionTarget(
+        IcebergDataFileUpdatesSync.of(
+            mockColumnStatsConverter, IcebergPartitionValueConverter.getInstance()));
+  }
+
+  private IcebergConversionTarget getConversionTarget(
+      IcebergDataFileUpdatesSync dataFileUpdatesSync) {
     return new IcebergConversionTarget(
         TargetTable.builder()
             .basePath(basePath.toString())
@@ -202,8 +216,7 @@ public class TestIcebergSync {
         mockSchemaSync,
         mockPartitionSpecExtractor,
         mockPartitionSpecSync,
-        IcebergDataFileUpdatesSync.of(
-            mockColumnStatsConverter, IcebergPartitionValueConverter.getInstance()),
+        dataFileUpdatesSync,
         IcebergTableManager.of(CONFIGURATION));
   }
 
@@ -359,6 +372,100 @@ public class TestIcebergSync {
     Table table = getTable(basePath);
     assertEquals(4, table.history().size());
     assertEquals(snapshotIdBeforeCorruption, table.currentSnapshot().parentId());
+  }
+
+  /**
+   * Reproduces the production failure mode where a leaf manifest .avro is deleted from object
+   * storage (e.g., GCS bucket lifecycle removing the noncurrent generation after N days) but the
+   * manifest list still references it. The original {@code rollbackCorruptCommits} only probed the
+   * manifest list itself and would let execution proceed into {@code planFiles()}, which then
+   * failed with NotFoundException. Verifies the extended check rolls back to the previous snapshot
+   * and the next sync succeeds.
+   */
+  @Test
+  public void testLeafManifestMissingRollback() throws Exception {
+    InternalTable table1 =
+        getInternalTable(tableName, basePath, internalSchema, null, LAST_COMMIT_TIME);
+    InternalTable table2 =
+        getInternalTable(
+            tableName, basePath, internalSchema, null, LAST_COMMIT_TIME.plusMillis(100000L));
+
+    InternalDataFile dataFile1 = getDataFile(1, Collections.emptyList());
+    InternalDataFile dataFile2 = getDataFile(2, Collections.emptyList());
+    InternalDataFile dataFile3 = getDataFile(3, Collections.emptyList());
+    InternalDataFile dataFile4 = getDataFile(4, Collections.emptyList());
+    InternalSnapshot snapshot1 = buildSnapshot(table1, "0", dataFile1, dataFile2);
+    InternalSnapshot snapshot2 = buildSnapshot(table2, "1", dataFile2, dataFile3);
+    InternalSnapshot snapshot3 = buildSnapshot(table2, "2", dataFile3, dataFile4);
+    when(mockSchemaExtractor.toIceberg(internalSchema)).thenReturn(icebergSchema);
+    ArgumentCaptor<Schema> partitionSpecSchemaArgumentCaptor =
+        ArgumentCaptor.forClass(Schema.class);
+    when(mockPartitionSpecExtractor.toIceberg(
+            eq(null), partitionSpecSchemaArgumentCaptor.capture()))
+        .thenReturn(PartitionSpec.unpartitioned())
+        .thenReturn(PartitionSpec.unpartitioned())
+        .thenReturn(PartitionSpec.unpartitioned());
+    mockColStatsForFile(dataFile1, 2);
+    mockColStatsForFile(dataFile2, 2);
+    mockColStatsForFile(dataFile3, 2);
+    mockColStatsForFile(dataFile4, 1);
+
+    TableFormatSync.getInstance()
+        .syncSnapshot(Collections.singletonList(conversionTarget), snapshot1);
+    long snapshotIdBeforeCorruption = getTable(basePath).currentSnapshot().snapshotId();
+    TableFormatSync.getInstance()
+        .syncSnapshot(Collections.singletonList(conversionTarget), snapshot2);
+
+    // Delete one of the leaf manifests of the current snapshot to simulate lifecycle deletion.
+    Table tableAfterSnapshot2 = new HadoopTables(CONFIGURATION).load(basePath.toString());
+    String victimManifest =
+        tableAfterSnapshot2.currentSnapshot().allManifests(tableAfterSnapshot2.io()).get(0).path();
+    Files.delete(Paths.get(URI.create(victimManifest)));
+
+    // The next sync should detect the corruption during init() (rollbackCorruptCommits), roll
+    // back to the snapshot before snapshot2, and clear the XTable metadata so the next sync round
+    // performs a full snapshot sync.
+    Optional<Instant> actual =
+        getConversionTarget().getTableMetadata().map(TableSyncMetadata::getLastInstantSynced);
+    assertFalse(actual.isPresent());
+
+    TableFormatSync.getInstance()
+        .syncSnapshot(Collections.singletonList(conversionTarget), snapshot3);
+    validateIcebergTable(
+        tableName, table2, Sets.newHashSet(dataFile3, dataFile4), null, icebergSchema);
+    Table table = getTable(basePath);
+    assertEquals(4, table.history().size());
+    assertEquals(snapshotIdBeforeCorruption, table.currentSnapshot().parentId());
+  }
+
+  /**
+   * When the only snapshot is unreadable there is nothing to roll back to. Syncing on top of it
+   * would carry the missing manifest forward, so initialization must fail instead.
+   */
+  @Test
+  public void testUnrecoverableManifestLossFails() throws Exception {
+    InternalTable table1 =
+        getInternalTable(tableName, basePath, internalSchema, null, LAST_COMMIT_TIME);
+    InternalDataFile dataFile1 = getDataFile(1, Collections.emptyList());
+    InternalDataFile dataFile2 = getDataFile(2, Collections.emptyList());
+    InternalSnapshot snapshot1 = buildSnapshot(table1, "0", dataFile1, dataFile2);
+    when(mockSchemaExtractor.toIceberg(internalSchema)).thenReturn(icebergSchema);
+    when(mockPartitionSpecExtractor.toIceberg(eq(null), any()))
+        .thenReturn(PartitionSpec.unpartitioned());
+    mockColStatsForFile(dataFile1, 1);
+    mockColStatsForFile(dataFile2, 1);
+    TableFormatSync.getInstance()
+        .syncSnapshot(Collections.singletonList(conversionTarget), snapshot1);
+
+    Table table = new HadoopTables(CONFIGURATION).load(basePath.toString());
+    long snapshotId = table.currentSnapshot().snapshotId();
+    String manifest = table.currentSnapshot().allManifests(table.io()).get(0).path();
+    Files.delete(Paths.get(URI.create(manifest)));
+
+    IllegalStateException e =
+        assertThrows(IllegalStateException.class, () -> getConversionTarget().getTableMetadata());
+    assertTrue(e.getMessage().contains("no earlier snapshot to roll back to"));
+    assertEquals(snapshotId, getTable(basePath).currentSnapshot().snapshotId());
   }
 
   @Test
@@ -623,6 +730,84 @@ public class TestIcebergSync {
   }
 
   @Test
+  public void testAddedFilesWrittenInManifestBatches() throws Exception {
+    conversionTarget =
+        getConversionTarget(
+            new IcebergDataFileUpdatesSync(
+                mockColumnStatsConverter, IcebergPartitionValueConverter.getInstance(), 2));
+    InternalPartitionField partitionField =
+        InternalPartitionField.builder()
+            .sourceField(
+                SchemaFieldFinder.getInstance().findFieldByPath(internalSchema, "group_id"))
+            .transformType(PartitionTransformType.VALUE)
+            .build();
+    InternalTable table =
+        getInternalTable(
+            tableName,
+            basePath,
+            internalSchema,
+            Collections.singletonList(partitionField),
+            LAST_COMMIT_TIME);
+    List<PartitionValue> partitionValues1 =
+        Collections.singletonList(
+            PartitionValue.builder().partitionField(partitionField).range(Range.scalar(1)).build());
+    List<PartitionValue> partitionValues2 =
+        Collections.singletonList(
+            PartitionValue.builder().partitionField(partitionField).range(Range.scalar(2)).build());
+    InternalDataFile dataFile1 = getDataFile(1, partitionValues1);
+    InternalDataFile dataFile2 = getDataFile(2, partitionValues1);
+    InternalDataFile dataFile3 = getDataFile(3, partitionValues2);
+    InternalDataFile dataFile4 = getDataFile(4, partitionValues2);
+    InternalSnapshot snapshot1 = buildSnapshot(table, "0", dataFile1, dataFile2, dataFile3);
+    InternalSnapshot snapshot2 = buildSnapshot(table, "1", dataFile2, dataFile3, dataFile4);
+
+    when(mockSchemaExtractor.toIceberg(internalSchema)).thenReturn(icebergSchema);
+    PartitionSpec partitionSpec =
+        PartitionSpec.builderFor(icebergSchema)
+            .identity(partitionField.getSourceField().getName())
+            .build();
+    when(mockPartitionSpecExtractor.toIceberg(
+            eq(Collections.singletonList(partitionField)), any(Schema.class)))
+        .thenReturn(partitionSpec);
+    mockColStatsForFile(dataFile1, 1);
+    mockColStatsForFile(dataFile2, 1);
+    mockColStatsForFile(dataFile3, 1);
+    mockColStatsForFile(dataFile4, 1);
+
+    // the first sync only adds files, so they are written into manifests of 2 files each
+    TableFormatSync.getInstance()
+        .syncSnapshot(Collections.singletonList(conversionTarget), snapshot1);
+    Table icebergTable = getTable(basePath);
+    assertEquals(2, icebergTable.currentSnapshot().allManifests(icebergTable.io()).size());
+    assertEquals(
+        "3", icebergTable.currentSnapshot().summary().get(SnapshotSummary.ADDED_FILES_PROP));
+    assertEquals(
+        Optional.of(String.valueOf(icebergTable.currentSnapshot().snapshotId())),
+        conversionTarget.getTargetCommitIdentifier("0"));
+    validateIcebergTable(
+        tableName,
+        table,
+        Sets.newHashSet(dataFile1, dataFile2),
+        Expressions.equal(partitionField.getSourceField().getName(), 1),
+        icebergSchema);
+    validateIcebergTable(
+        tableName,
+        table,
+        Sets.newHashSet(dataFile3),
+        Expressions.equal(partitionField.getSourceField().getName(), 2),
+        icebergSchema);
+
+    // the second sync also removes a file, so it goes through a regular overwrite
+    TableFormatSync.getInstance()
+        .syncSnapshot(Collections.singletonList(conversionTarget), snapshot2);
+    validateIcebergTable(
+        tableName, table, Sets.newHashSet(dataFile2, dataFile3, dataFile4), null, icebergSchema);
+    assertEquals(
+        Optional.of(String.valueOf(getTable(basePath).currentSnapshot().snapshotId())),
+        conversionTarget.getTargetCommitIdentifier("1"));
+  }
+
+  @Test
   public void testNestedFieldPartitioning() throws Exception {
     // test partition filtering
     InternalPartitionField partitionField =
@@ -781,6 +966,100 @@ public class TestIcebergSync {
     assertFalse(targetIdentifier.isPresent());
   }
 
+  @Test
+  public void testSnapshotsExpiredOnFirstCommitOfRunOnly() throws Exception {
+    InternalTable table =
+        getInternalTable(tableName, basePath, internalSchema, null, LAST_COMMIT_TIME);
+    InternalDataFile dataFile1 = getDataFile(1, Collections.emptyList());
+    InternalDataFile dataFile2 = getDataFile(2, Collections.emptyList());
+    InternalDataFile dataFile3 = getDataFile(3, Collections.emptyList());
+    InternalDataFile dataFile4 = getDataFile(4, Collections.emptyList());
+    when(mockSchemaExtractor.toIceberg(internalSchema)).thenReturn(icebergSchema);
+    when(mockPartitionSpecExtractor.toIceberg(eq(null), any()))
+        .thenReturn(PartitionSpec.unpartitioned());
+    mockColStatsForFile(dataFile1, 1);
+    mockColStatsForFile(dataFile2, 1);
+    mockColStatsForFile(dataFile3, 1);
+    mockColStatsForFile(dataFile4, 1);
+
+    // one run: only its first commit expires, so the later commits keep every snapshot
+    IcebergConversionTarget firstRun = getConversionTargetWithZeroRetention();
+    syncSnapshot(firstRun, buildSnapshot(table, "0", dataFile1));
+    syncSnapshot(firstRun, buildSnapshot(table, "1", dataFile1, dataFile2));
+    syncSnapshot(firstRun, buildSnapshot(table, "2", dataFile1, dataFile2, dataFile3));
+    assertEquals(3, Iterables.size(getTable(basePath).snapshots()));
+    assertEquals(3, countManifestLists());
+
+    // the next run's first commit expires everything past retention and cleans up its files
+    IcebergConversionTarget secondRun = getConversionTargetWithZeroRetention();
+    syncSnapshot(secondRun, buildSnapshot(table, "3", dataFile1, dataFile2, dataFile3, dataFile4));
+    Table icebergTable = getTable(basePath);
+    assertEquals(1, Iterables.size(icebergTable.snapshots()));
+    assertEquals(1, countManifestLists());
+    validateIcebergTable(
+        tableName,
+        table,
+        Sets.newHashSet(dataFile1, dataFile2, dataFile3, dataFile4),
+        null,
+        icebergSchema);
+  }
+
+  @Test
+  public void testSnapshotsExpiredOnEveryCommitWithZeroInterval() throws Exception {
+    InternalTable table =
+        getInternalTable(tableName, basePath, internalSchema, null, LAST_COMMIT_TIME);
+    InternalDataFile dataFile1 = getDataFile(1, Collections.emptyList());
+    InternalDataFile dataFile2 = getDataFile(2, Collections.emptyList());
+    InternalDataFile dataFile3 = getDataFile(3, Collections.emptyList());
+    when(mockSchemaExtractor.toIceberg(internalSchema)).thenReturn(icebergSchema);
+    when(mockPartitionSpecExtractor.toIceberg(eq(null), any()))
+        .thenReturn(PartitionSpec.unpartitioned());
+    mockColStatsForFile(dataFile1, 1);
+    mockColStatsForFile(dataFile2, 1);
+    mockColStatsForFile(dataFile3, 1);
+
+    IcebergConversionTarget target = getConversionTargetWithZeroRetention();
+    target.setSnapshotExpiryInterval(Duration.ZERO);
+    syncSnapshot(target, buildSnapshot(table, "0", dataFile1));
+    syncSnapshot(target, buildSnapshot(table, "1", dataFile1, dataFile2));
+    syncSnapshot(target, buildSnapshot(table, "2", dataFile1, dataFile2, dataFile3));
+    assertEquals(1, Iterables.size(getTable(basePath).snapshots()));
+    assertEquals(1, countManifestLists());
+  }
+
+  private IcebergConversionTarget getConversionTargetWithZeroRetention() {
+    return new IcebergConversionTarget(
+        TargetTable.builder()
+            .basePath(basePath.toString())
+            .name(tableName)
+            .metadataRetention(Duration.ZERO)
+            .formatName(TableFormat.ICEBERG)
+            .build(),
+        CONFIGURATION,
+        mockSchemaExtractor,
+        mockSchemaSync,
+        mockPartitionSpecExtractor,
+        mockPartitionSpecSync,
+        IcebergDataFileUpdatesSync.of(
+            mockColumnStatsConverter, IcebergPartitionValueConverter.getInstance()),
+        IcebergTableManager.of(CONFIGURATION));
+  }
+
+  private void syncSnapshot(IcebergConversionTarget target, InternalSnapshot snapshot) {
+    Map<String, SyncResult> results =
+        TableFormatSync.getInstance().syncSnapshot(Collections.singletonList(target), snapshot);
+    assertEquals(
+        SyncResult.SyncStatus.SUCCESS,
+        results.get(TableFormat.ICEBERG).getTableFormatSyncStatus(),
+        "sync of " + snapshot.getSourceIdentifier() + " failed");
+  }
+
+  private long countManifestLists() throws IOException {
+    try (Stream<Path> files = Files.list(basePath.resolve("metadata"))) {
+      return files.filter(file -> file.getFileName().toString().startsWith("snap-")).count();
+    }
+  }
+
   private InternalSnapshot buildSnapshot(
       InternalTable table, String sourceIdentifier, InternalDataFile... dataFiles) {
     return InternalSnapshot.builder()
@@ -796,7 +1075,7 @@ public class TestIcebergSync {
         .fileFormat(FileFormat.APACHE_PARQUET)
         .fileSizeBytes(RANDOM.nextInt(10000))
         .physicalPath(physicalPath)
-        .recordCount(RANDOM.nextInt(10000))
+        .recordCount(RANDOM.nextInt(10000) + 1)
         .partitionValues(partitionValues)
         .columnStats(Collections.emptyList())
         .build();

@@ -36,6 +36,10 @@ tableFormatConverters:
       configuration:
         spark.master: local[2]
         spark.app.name: xtable
+        # Read the Delta snapshot once per incremental backlog instead of once per commit.
+        xtable.delta.source.reuse_metadata_across_commits: "true"
     ICEBERG:
       conversionSourceProviderClass: org.apache.xtable.iceberg.IcebergConversionSourceProvider
       conversionTargetProviderClass: org.apache.xtable.iceberg.IcebergConversionTarget
+    PAIMON:
+      conversionSourceProviderClass: org.apache.xtable.paimon.PaimonConversionSourceProvider

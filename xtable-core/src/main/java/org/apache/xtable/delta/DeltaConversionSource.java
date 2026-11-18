@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import lombok.Builder;
 import lombok.extern.log4j.Log4j2;
@@ -38,9 +39,12 @@ import org.apache.spark.sql.delta.DeltaLog;
 import org.apache.spark.sql.delta.Snapshot;
 import org.apache.spark.sql.delta.actions.Action;
 import org.apache.spark.sql.delta.actions.AddFile;
+import org.apache.spark.sql.delta.actions.Metadata;
 import org.apache.spark.sql.delta.actions.RemoveFile;
 
 import scala.Option;
+
+import com.google.common.base.Preconditions;
 
 import io.delta.tables.DeltaTable;
 
@@ -78,6 +82,13 @@ public class DeltaConversionSource implements ConversionSource<Long> {
   private final String tableName;
   private final String basePath;
 
+  // See DeltaConversionSourceConfig#REUSE_METADATA_ACROSS_COMMITS.
+  @Builder.Default private final boolean reuseMetadataAcrossCommits = false;
+
+  // Scoped to a single backlog; cleared by resetState.
+  private Metadata cachedMetadata;
+  private Long lastProcessedVersion;
+
   @Override
   public InternalTable getTable(Long version) {
     return tableExtractor.table(deltaLog, tableName, version);
@@ -85,16 +96,14 @@ public class DeltaConversionSource implements ConversionSource<Long> {
 
   @Override
   public InternalTable getCurrentTable() {
-    DeltaLog deltaLog = DeltaLog.forTable(sparkSession, basePath);
     Snapshot snapshot = deltaLog.snapshot();
-    return getTable(snapshot.version());
+    return tableExtractor.table(snapshot, tableName);
   }
 
   @Override
   public InternalSnapshot getCurrentSnapshot() {
-    DeltaLog deltaLog = DeltaLog.forTable(sparkSession, basePath);
     Snapshot snapshot = deltaLog.snapshot();
-    InternalTable table = getTable(snapshot.version());
+    InternalTable table = tableExtractor.table(snapshot, tableName);
     return InternalSnapshot.builder()
         .table(table)
         .partitionedDataFiles(getInternalDataFiles(snapshot, table.getReadSchema()))
@@ -104,11 +113,28 @@ public class DeltaConversionSource implements ConversionSource<Long> {
 
   @Override
   public TableChange getTableChangeForCommit(Long versionNumber) {
-    InternalTable tableAtVersion = tableExtractor.table(deltaLog, tableName, versionNumber);
     List<Action> actionsForVersion = getChangesState().getActionsForVersion(versionNumber);
-    Snapshot snapshotAtVersion = deltaLog.getSnapshotAt(versionNumber, Option.empty());
-    FileFormat fileFormat =
-        actionsConverter.convertToFileFormat(snapshotAtVersion.metadata().format().provider());
+    String tableBasePath = deltaLog.dataPath().toUri().toString();
+    InternalTable tableAtVersion;
+    FileFormat fileFormat;
+    if (reuseMetadataAcrossCommits) {
+      Metadata metadataAtVersion = resolveMetadataForCommit(versionNumber, actionsForVersion);
+      // latestCommitTime is persisted as the sync watermark and matched against commit-file mtimes
+      // on the next run, so it must come from that clock. Snapshot.timestamp() is the same mtime;
+      // the changes state carries it without the read.
+      tableAtVersion =
+          tableExtractor.table(
+              metadataAtVersion,
+              deltaLog,
+              tableName,
+              getChangesState().getCommitTimestamp(versionNumber));
+      fileFormat = actionsConverter.convertToFileFormat(metadataAtVersion.format().provider());
+    } else {
+      Snapshot snapshotAtVersion = deltaLog.getSnapshotAt(versionNumber, Option.empty());
+      tableAtVersion = tableExtractor.table(snapshotAtVersion, tableName);
+      fileFormat =
+          actionsConverter.convertToFileFormat(snapshotAtVersion.metadata().format().provider());
+    }
 
     // All 3 of the following data structures use data file's absolute path as the key
     Map<String, InternalDataFile> addedFiles = new HashMap<>();
@@ -116,29 +142,36 @@ public class DeltaConversionSource implements ConversionSource<Long> {
     // Set of data file paths for which deletion vectors exists.
     Set<String> deletionVectors = new HashSet<>();
 
+    List<AddFile> addActions =
+        actionsForVersion.stream()
+            .filter(AddFile.class::isInstance)
+            .map(AddFile.class::cast)
+            .collect(Collectors.toList());
+    List<InternalDataFile> addedDataFiles =
+        actionsConverter.convertAddActionsToInternalDataFiles(
+            addActions,
+            tableBasePath,
+            fileFormat,
+            tableAtVersion.getPartitioningFields(),
+            tableAtVersion.getReadSchema().getAllFields(),
+            true,
+            DeltaPartitionExtractor.getInstance(),
+            DeltaStatsExtractor.getInstance());
+    for (int i = 0; i < addActions.size(); i++) {
+      InternalDataFile dataFile = addedDataFiles.get(i);
+      addedFiles.put(dataFile.getPhysicalPath(), dataFile);
+      String deleteVectorPath =
+          actionsConverter.extractDeletionVectorFile(tableBasePath, addActions.get(i));
+      if (deleteVectorPath != null) {
+        deletionVectors.add(deleteVectorPath);
+      }
+    }
     for (Action action : actionsForVersion) {
-      if (action instanceof AddFile) {
-        InternalDataFile dataFile =
-            actionsConverter.convertAddActionToInternalDataFile(
-                (AddFile) action,
-                snapshotAtVersion,
-                fileFormat,
-                tableAtVersion.getPartitioningFields(),
-                tableAtVersion.getReadSchema().getFields(),
-                true,
-                DeltaPartitionExtractor.getInstance(),
-                DeltaStatsExtractor.getInstance());
-        addedFiles.put(dataFile.getPhysicalPath(), dataFile);
-        String deleteVectorPath =
-            actionsConverter.extractDeletionVectorFile(snapshotAtVersion, (AddFile) action);
-        if (deleteVectorPath != null) {
-          deletionVectors.add(deleteVectorPath);
-        }
-      } else if (action instanceof RemoveFile) {
+      if (action instanceof RemoveFile) {
         InternalDataFile dataFile =
             actionsConverter.convertRemoveActionToInternalDataFile(
                 (RemoveFile) action,
-                snapshotAtVersion,
+                tableBasePath,
                 fileFormat,
                 tableAtVersion.getPartitioningFields(),
                 DeltaPartitionExtractor.getInstance());
@@ -210,17 +243,57 @@ public class DeltaConversionSource implements ConversionSource<Long> {
     return String.valueOf(commit);
   }
 
+  /**
+   * Returns the table metadata as of the given commit, reading a snapshot only for the first commit
+   * of a backlog. Everything the conversion needs from the snapshot derives from the table
+   * metadata, so it is carried across the backlog rather than re-read from the checkpoint per
+   * commit, and refreshed from the commit's own metadata action when the schema evolves.
+   */
+  private Metadata resolveMetadataForCommit(Long versionNumber, List<Action> actionsForVersion) {
+    // Walking backwards would convert a commit with metadata the table did not have yet, and
+    // nothing would correct it, so pin the ordering the SPI does not state.
+    Preconditions.checkArgument(
+        lastProcessedVersion == null || versionNumber >= lastProcessedVersion,
+        String.format(
+            "Version %s is before the last processed version %s. A backlog must be walked in "
+                + "non-decreasing version order when %s is enabled.",
+            versionNumber,
+            lastProcessedVersion,
+            DeltaConversionSourceConfig.REUSE_METADATA_ACROSS_COMMITS));
+    lastProcessedVersion = versionNumber;
+    Metadata metadataInCommit = null;
+    for (Action action : actionsForVersion) {
+      if (action instanceof Metadata) {
+        // last one in a commit wins, mirroring InMemoryLogReplay
+        metadataInCommit = (Metadata) action;
+      }
+    }
+    if (cachedMetadata == null) {
+      // baseline; the snapshot is read for its metadata and not retained
+      cachedMetadata = deltaLog.getSnapshotAt(versionNumber, Option.empty()).metadata();
+    } else if (metadataInCommit != null) {
+      cachedMetadata = metadataInCommit;
+    }
+    return cachedMetadata;
+  }
+
   private DeltaIncrementalChangesState getChangesState() {
     return deltaIncrementalChangesState.orElseThrow(
         () -> new IllegalStateException("DeltaIncrementalChangesState is not initialized"));
   }
 
   private void resetState(long versionToStartFrom) {
+    // The cache is scoped to one backlog, not to the source instance: an embedder holding a source
+    // across syncs can start a later backlog at an earlier version, which would otherwise convert
+    // those commits with newer metadata. Clearing costs one snapshot read per backlog.
+    cachedMetadata = null;
+    lastProcessedVersion = null;
     deltaIncrementalChangesState =
         Optional.of(
             DeltaIncrementalChangesState.builder()
                 .deltaLog(deltaLog)
                 .versionToStartFrom(versionToStartFrom)
+                .loadCommitTimestamps(reuseMetadataAcrossCommits)
                 .build());
   }
 

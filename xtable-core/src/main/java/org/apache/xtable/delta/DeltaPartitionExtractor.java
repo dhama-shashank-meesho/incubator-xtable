@@ -19,6 +19,7 @@
 package org.apache.xtable.delta;
 
 import static org.apache.xtable.collectors.CustomCollectors.toList;
+import static org.apache.xtable.delta.Constants.DELTA_GENERATION_EXPRESSION;
 import static org.apache.xtable.delta.DeltaValueConverter.convertFromDeltaPartitionValue;
 import static org.apache.xtable.delta.DeltaValueConverter.convertToDeltaPartitionValue;
 
@@ -27,6 +28,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -79,7 +81,6 @@ public class DeltaPartitionExtractor {
   // For timestamp partition fields, actual partition column names in delta format will be of type
   // generated & and with a name like `delta_partition_col_{transform_type}_{source_field_name}`.
   private static final String DELTA_PARTITION_COL_NAME_FORMAT = "xtable_partition_col_%s_%s";
-  static final String DELTA_GENERATION_EXPRESSION = "delta.generationExpression";
   private static final List<ParsedGeneratedExpr.GeneratedExprType> GRANULARITIES =
       Arrays.asList(
           ParsedGeneratedExpr.GeneratedExprType.YEAR,
@@ -234,7 +235,8 @@ public class DeltaPartitionExtractor {
     if (partitionFields == null) {
       return null;
     }
-    Map<String, StructField> nameToStructFieldMap = new HashMap<>();
+    // insertion order is the partition column order written to the Delta log
+    Map<String, StructField> nameToStructFieldMap = new LinkedHashMap<>();
     for (InternalPartitionField internalPartitionField : partitionFields) {
       String currPartitionColumnName;
       StructField field;
@@ -326,9 +328,11 @@ public class DeltaPartitionExtractor {
     if (partitionFieldNames.size() == 1) {
       return values.getOrDefault(partitionFieldNames.get(0), null);
     }
-    return partitionFieldNames.stream()
-        .map(name -> values.get(name))
-        .collect(Collectors.joining("-"));
+    // Composite partition: any null component yields a null value, not joined "null"s.
+    if (partitionFieldNames.stream().anyMatch(name -> values.get(name) == null)) {
+      return null;
+    }
+    return partitionFieldNames.stream().map(values::get).collect(Collectors.joining("-"));
   }
 
   private String getGeneratedColumnName(InternalPartitionField internalPartitionField) {

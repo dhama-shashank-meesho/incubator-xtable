@@ -18,17 +18,23 @@
  
 package org.apache.xtable.iceberg;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import lombok.extern.log4j.Log4j2;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 
+import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
@@ -39,6 +45,15 @@ import org.apache.iceberg.UpdateProperties;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.NotFoundException;
+import org.apache.iceberg.mapping.MappedField;
+import org.apache.iceberg.mapping.MappedFields;
+import org.apache.iceberg.mapping.MappingUtil;
+import org.apache.iceberg.mapping.NameMapping;
+import org.apache.iceberg.mapping.NameMappingParser;
+import org.apache.iceberg.util.Tasks;
+import org.apache.iceberg.util.ThreadPools;
+
+import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.xtable.conversion.TargetTable;
 import org.apache.xtable.model.InternalTable;
@@ -53,6 +68,13 @@ import org.apache.xtable.spi.sync.ConversionTarget;
 @Log4j2
 public class IcebergConversionTarget implements ConversionTarget {
   private static final String METADATA_DIR_PATH = "/metadata/";
+  // Expiring snapshots with file cleanup reads the manifest list of every retained snapshot one at
+  // a time, which dominates the commit time of a table that commits often (~4k snapshots take
+  // minutes on GCS). Snapshots are expired on the first commit of a sync run and then at most once
+  // per this interval. A skipped expiry is only deferred: the next one expires and cleans up
+  // everything past retention, so it leaves no orphan files. 0 expires on every commit.
+  private static final Duration DEFAULT_SNAPSHOT_EXPIRY_INTERVAL =
+      Duration.ofMinutes(Long.getLong("xtable.iceberg.snapshotExpiryIntervalMinutes", 60));
   private IcebergSchemaExtractor schemaExtractor;
   private IcebergSchemaSync schemaSync;
   private IcebergPartitionSpecExtractor partitionSpecExtractor;
@@ -64,6 +86,9 @@ public class IcebergConversionTarget implements ConversionTarget {
   private IcebergCatalogConfig catalogConfig;
   private Configuration configuration;
   private int snapshotRetentionInHours;
+  private Duration snapshotExpiryInterval = DEFAULT_SNAPSHOT_EXPIRY_INTERVAL;
+  // when this target last expired snapshots; null until its first commit
+  private Instant lastSnapshotExpiry;
   private Transaction transaction;
   private Table table;
   private InternalTable internalTableState;
@@ -161,13 +186,58 @@ public class IcebergConversionTarget implements ConversionTarget {
     }
   }
 
+  /**
+   * Create a name mapping from the given schema, add storage names in {@link
+   * IcebergSchemaExtractor#getIdToStorageName()}, if any exist, to the name mapping, and apply the
+   * updated mapping to the table.
+   *
+   * <p>This method should only be called when the name mapping is not set, or when field IDs are
+   * provided in the source schema
+   *
+   * @param schema the {@link Schema} from which to create the name mapping
+   */
+  private void createAndSetNameMapping(Schema schema) {
+    NameMapping mapping = MappingUtil.create(schema);
+    MappedFields updatedMappedFields =
+        updateNameMapping(mapping.asMappedFields(), schemaExtractor.getIdToStorageName());
+    transaction
+        .updateProperties()
+        .set(
+            TableProperties.DEFAULT_NAME_MAPPING,
+            NameMappingParser.toJson(NameMapping.of(updatedMappedFields)))
+        .commit();
+  }
+
+  private MappedFields updateNameMapping(
+      MappedFields mapping, Map<Integer, String> idToStorageName) {
+    if (mapping == null) {
+      return null;
+    }
+    List<MappedField> fieldResults = new ArrayList<>();
+    for (MappedField field : mapping.fields()) {
+      Set<String> fieldNames = new HashSet<>(field.names());
+      if (idToStorageName.containsKey(field.id())) {
+        fieldNames.add(idToStorageName.get(field.id()));
+      }
+      MappedFields nestedMapping = updateNameMapping(field.nestedMapping(), idToStorageName);
+      fieldResults.add(MappedField.of(field.id(), fieldNames, nestedMapping));
+    }
+    return MappedFields.of(fieldResults);
+  }
+
   @Override
   public void syncSchema(InternalSchema schema) {
     Schema latestSchema = schemaExtractor.toIceberg(schema);
+    if (!transaction.table().properties().containsKey(TableProperties.DEFAULT_NAME_MAPPING)) {
+      createAndSetNameMapping(latestSchema);
+    }
     if (!transaction.table().schema().sameSchema(latestSchema)) {
       boolean hasFieldIds =
           schema.getAllFields().stream().anyMatch(field -> field.getFieldId() != null);
       if (hasFieldIds) {
+        // If field IDs are provided in the source schema, manually update the name mapping to
+        // ensure the IDs match the correct fields.
+        createAndSetNameMapping(latestSchema);
         // There is no clean way to sync the schema with the provided field IDs using the
         // transaction API so we commit the current transaction and interact directly with
         // the operations API.
@@ -235,17 +305,35 @@ public class IcebergConversionTarget implements ConversionTarget {
 
   @Override
   public void completeSync() {
-    transaction
-        .expireSnapshots()
-        .expireOlderThan(
-            Instant.now().minus(snapshotRetentionInHours, ChronoUnit.HOURS).toEpochMilli())
-        .deleteWith(this::safeDelete) // ensures that only metadata files are deleted
-        .cleanExpiredFiles(true)
-        .commit();
+    Instant now = Instant.now();
+    boolean expireSnapshots =
+        lastSnapshotExpiry == null
+            || !now.isBefore(lastSnapshotExpiry.plus(snapshotExpiryInterval));
+    if (expireSnapshots) {
+      transaction
+          .expireSnapshots()
+          .expireOlderThan(now.minus(snapshotRetentionInHours, ChronoUnit.HOURS).toEpochMilli())
+          .deleteWith(this::safeDelete) // ensures that only metadata files are deleted
+          .cleanExpiredFiles(true)
+          .commit();
+      log.info(
+          "Expired snapshots older than {} hours for table {} in {} ms",
+          snapshotRetentionInHours,
+          tableIdentifier,
+          Duration.between(now, Instant.now()).toMillis());
+    }
     transaction.commitTransaction();
+    if (expireSnapshots) {
+      lastSnapshotExpiry = now;
+    }
     transaction = null;
     internalTableState = null;
     tableSyncMetadata = null;
+  }
+
+  @VisibleForTesting
+  void setSnapshotExpiryInterval(Duration snapshotExpiryInterval) {
+    this.snapshotExpiryInterval = snapshotExpiryInterval;
   }
 
   private void safeDelete(String file) {
@@ -299,30 +387,84 @@ public class IcebergConversionTarget implements ConversionTarget {
       // there is no existing table so exit early
       return;
     }
-    // There are cases when using the HadoopTables API where the table metadata json is updated but
-    // the manifest file is not written, causing corruption. This is a workaround to fix the issue.
-    if (catalogConfig == null && table.currentSnapshot() != null) {
-      boolean validSnapshot = false;
-      while (!validSnapshot) {
-        try {
-          table.currentSnapshot().allManifests(table.io());
-          validSnapshot = true;
-        } catch (NotFoundException ex) {
-          Snapshot currentSnapshot = table.currentSnapshot();
-          log.warn(
-              "Corrupt snapshot detected for table: {} snapshotId: {}. Rolling back to previous snapshot: {}.",
-              tableIdentifier,
-              currentSnapshot.snapshotId(),
-              currentSnapshot.parentId());
-          // if we need to rollback, we must also clear the last sync state since that sync is no
-          // longer considered valid. This will force InternalTable to fall back to a snapshot sync
-          // in the subsequent sync round.
-          table.manageSnapshots().rollbackTo(currentSnapshot.parentId()).commit();
-          Transaction transaction = table.newTransaction();
-          transaction.updateProperties().remove(TableSyncMetadata.XTABLE_METADATA).commit();
-          transaction.commitTransaction();
-        }
-      }
+    if (table.currentSnapshot() == null) {
+      return;
     }
+    // Walk back from the current snapshot until we find one whose manifest list and every
+    // manifest are readable. Two failure modes are handled:
+    //   1. HadoopTables corruption: metadata.json is updated but the manifest list isn't written.
+    //   2. Manifests deleted from storage while still referenced, e.g. by snapshot expiry in a
+    //      concurrent sync of the same table, or by a bucket lifecycle rule.
+    // Mode (1) only applies to HadoopTables (no catalog); mode (2) applies to any catalog.
+    while (true) {
+      Snapshot currentSnapshot = table.currentSnapshot();
+      if (currentSnapshot == null) {
+        return;
+      }
+      String corruptionReason = detectSnapshotCorruption(currentSnapshot);
+      if (corruptionReason == null) {
+        return;
+      }
+      Long parentId = currentSnapshot.parentId();
+      if (parentId == null || table.snapshot(parentId) == null) {
+        // Committing on top of this snapshot would carry the unreadable manifests forward, so fail
+        // instead of producing a table that reports success but cannot be read.
+        throw new IllegalStateException(
+            String.format(
+                "Iceberg table %s is unreadable at snapshot %d (%s) and has no earlier snapshot to"
+                    + " roll back to. Delete the table's Iceberg metadata directory and resync to"
+                    + " rebuild it from the source.",
+                tableIdentifier, currentSnapshot.snapshotId(), corruptionReason));
+      }
+      log.warn(
+          "Corrupt snapshot detected for table: {} snapshotId: {} ({}). Rolling back to previous"
+              + " snapshot: {}; the next sync will be a full snapshot sync.",
+          tableIdentifier,
+          currentSnapshot.snapshotId(),
+          corruptionReason,
+          parentId);
+      // Clear the last sync state alongside the rollback so the next sync round falls back to a
+      // full snapshot sync instead of trying an incremental diff against a stale identifier.
+      table.manageSnapshots().rollbackTo(parentId).commit();
+      Transaction rollbackTxn = table.newTransaction();
+      rollbackTxn.updateProperties().remove(TableSyncMetadata.XTABLE_METADATA).commit();
+      rollbackTxn.commitTransaction();
+    }
+  }
+
+  /**
+   * Returns a non-null short description if the snapshot is unreadable, or {@code null} if it's
+   * fully valid. Checks manifest-list readability (HadoopTables-only corruption) and leaf-manifest
+   * existence (applies to any catalog when external deletion has occurred).
+   */
+  private String detectSnapshotCorruption(Snapshot snapshot) {
+    List<ManifestFile> manifests;
+    try {
+      manifests = snapshot.allManifests(table.io());
+    } catch (NotFoundException ex) {
+      // Manifest list itself is missing — this is the HadoopTables-only failure mode the original
+      // guard was written for.
+      if (catalogConfig != null) {
+        // Don't treat as corrupt for catalog-managed tables: the catalog should be the source of
+        // truth, and a missing manifest list there indicates a different problem we shouldn't
+        // silently rewrite around.
+        throw ex;
+      }
+      return "manifest list missing: " + ex.getMessage();
+    }
+    Set<String> missingManifests = ConcurrentHashMap.newKeySet();
+    Tasks.foreach(manifests)
+        .executeWith(ThreadPools.getWorkerPool())
+        .run(
+            manifest -> {
+              if (!table.io().newInputFile(manifest.path()).exists()) {
+                missingManifests.add(manifest.path());
+              }
+            });
+    return missingManifests.isEmpty()
+        ? null
+        : missingManifests.size()
+            + " manifest(s) missing, e.g. "
+            + missingManifests.iterator().next();
   }
 }

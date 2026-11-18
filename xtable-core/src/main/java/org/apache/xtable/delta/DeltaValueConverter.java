@@ -28,7 +28,10 @@ import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
@@ -44,6 +47,14 @@ import org.apache.xtable.model.schema.PartitionTransformType;
  */
 public class DeltaValueConverter {
   private static final String DATE_FORMAT_STR = "yyyy-MM-dd HH:mm:ss";
+  // Delta writes timestamp column stats as ISO-8601 with milliseconds: with an offset for TIMESTAMP
+  // and without one for TIMESTAMP_NTZ. A TIMESTAMP stat without an offset is resolved in the
+  // reader's session time zone, which shifts the min/max and makes data skipping drop files whose
+  // rows match whenever that zone is not UTC.
+  private static final DateTimeFormatter TIMESTAMP_STAT_FORMAT =
+      DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSXXX").withZone(ZoneOffset.UTC);
+  private static final DateTimeFormatter TIMESTAMP_NTZ_STAT_FORMAT =
+      DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS").withZone(ZoneOffset.UTC);
   private static final TimeZone TIME_ZONE = TimeZone.getTimeZone("UTC");
   protected static final String NAN_VALUE = "NaN";
   protected static final String INFINITY_VALUE = "Infinity";
@@ -76,14 +87,7 @@ public class DeltaValueConverter {
     try {
       instant = OffsetDateTime.parse(value.toString()).toInstant();
     } catch (DateTimeParseException parseException) {
-      // fall back to parsing without offset
-      DateFormat dateFormat = getDateFormat(DATE_FORMAT_STR);
-      try {
-        instant = dateFormat.parse(value.toString()).toInstant();
-      } catch (ParseException ex) {
-        throw new org.apache.xtable.model.exception.ParseException(
-            "Unable to parse time from column stats", ex);
-      }
+      instant = parseTimestampWithoutOffset(value.toString());
     }
     InternalSchema.MetadataValue timestampPrecision =
         (InternalSchema.MetadataValue)
@@ -122,8 +126,24 @@ public class DeltaValueConverter {
         timestampPrecision == InternalSchema.MetadataValue.MICROS
             ? TimeUnit.MILLISECONDS.convert((Long) value, TimeUnit.MICROSECONDS)
             : (long) value;
-    DateFormat dateFormat = getDateFormat(DATE_FORMAT_STR);
-    return dateFormat.format(Date.from(Instant.ofEpochMilli(millis)));
+    DateTimeFormatter format =
+        fieldType == InternalType.TIMESTAMP_NTZ ? TIMESTAMP_NTZ_STAT_FORMAT : TIMESTAMP_STAT_FORMAT;
+    return format.format(Instant.ofEpochMilli(millis));
+  }
+
+  // Parses a stat value without an offset as UTC: ISO-8601 as Delta writes TIMESTAMP_NTZ stats,
+  // or "yyyy-MM-dd HH:mm:ss" as older XTable versions wrote them.
+  private static Instant parseTimestampWithoutOffset(String value) {
+    try {
+      return LocalDateTime.parse(value).toInstant(ZoneOffset.UTC);
+    } catch (DateTimeParseException isoException) {
+      try {
+        return getDateFormat(DATE_FORMAT_STR).parse(value).toInstant();
+      } catch (ParseException ex) {
+        throw new org.apache.xtable.model.exception.ParseException(
+            "Unable to parse time from column stats", ex);
+      }
+    }
   }
 
   private static boolean noConversionForSchema(InternalSchema fieldSchema) {
