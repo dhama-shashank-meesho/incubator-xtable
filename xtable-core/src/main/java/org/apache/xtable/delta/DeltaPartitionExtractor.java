@@ -28,6 +28,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -234,7 +235,8 @@ public class DeltaPartitionExtractor {
     if (partitionFields == null) {
       return null;
     }
-    Map<String, StructField> nameToStructFieldMap = new HashMap<>();
+    // insertion order is the partition column order written to the Delta log
+    Map<String, StructField> nameToStructFieldMap = new LinkedHashMap<>();
     for (InternalPartitionField internalPartitionField : partitionFields) {
       String currPartitionColumnName;
       StructField field;

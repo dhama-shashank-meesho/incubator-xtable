@@ -22,6 +22,7 @@ import static org.apache.xtable.delta.Constants.DELTA_GENERATION_EXPRESSION;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -131,6 +132,33 @@ public class TestDeltaKernelPartitionExtractor {
       DeltaKernelPartitionExtractor.getInstance();
   private final DeltaKernelSchemaExtractor deltaKernelSchemaExtractor =
       DeltaKernelSchemaExtractor.getInstance();
+
+  @Test
+  public void testConvertToDeltaPartitionFormatKeepsPartitionOrder() {
+    // names whose hash order differs from the order of the source partition spec
+    List<String> names = Arrays.asList("year", "month", "day", "dim__bu_category", "dim__dt");
+    List<InternalPartitionField> partitionFields =
+        names.stream()
+            .map(
+                name ->
+                    InternalPartitionField.builder()
+                        .sourceField(
+                            InternalField.builder()
+                                .name(name)
+                                .schema(
+                                    InternalSchema.builder()
+                                        .name("string")
+                                        .dataType(InternalType.STRING)
+                                        .build())
+                                .build())
+                        .transformType(PartitionTransformType.VALUE)
+                        .build())
+            .collect(Collectors.toList());
+    assertEquals(
+        names,
+        new ArrayList<>(
+            deltaKernelPartitionExtractor.convertToDeltaPartitionFormat(partitionFields).keySet()));
+  }
 
   @Test
   public void testUnpartitionedTable() {
