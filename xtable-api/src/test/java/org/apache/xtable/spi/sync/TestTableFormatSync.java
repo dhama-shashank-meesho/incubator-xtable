@@ -20,6 +20,7 @@ package org.apache.xtable.spi.sync;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
@@ -34,10 +35,15 @@ import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import org.apache.xtable.model.IncrementalTableChanges;
 import org.apache.xtable.model.InternalSnapshot;
@@ -480,5 +486,193 @@ public class TestTableFormatSync {
                 pendingCommitInstants,
                 startingTableState.getTableFormat(),
                 sourceIdentifier));
+  }
+
+  @AfterEach
+  void clearMergeProperties() {
+    System.clearProperty(TableFormatSync.MERGE_COMMITS_PROPERTY);
+    System.clearProperty(TableFormatSync.MAX_COMMITS_PER_SYNC_PROPERTY);
+  }
+
+  /** Table state that differs only in commit time, so consecutive states share a layout. */
+  private static InternalTable sameLayoutState(int id) {
+    return getTableState(0).toBuilder()
+        .latestCommitTime(Instant.now().minus(10 - id, ChronoUnit.MINUTES))
+        .build();
+  }
+
+  private static InternalDataFile file(String name) {
+    return InternalDataFile.builder().physicalPath("/tmp/path/" + name + ".parquet").build();
+  }
+
+  private static TableChange change(
+      InternalTable state, String id, List<String> add, List<String> remove) {
+    return TableChange.builder()
+        .tableAsOfChange(state)
+        .filesDiff(
+            InternalFilesDiff.builder()
+                .filesAdded(
+                    add.stream().map(TestTableFormatSync::file).collect(Collectors.toList()))
+                .filesRemoved(
+                    remove.stream().map(TestTableFormatSync::file).collect(Collectors.toList()))
+                .build())
+        .sourceIdentifier(id)
+        .build();
+  }
+
+  private Map<String, List<SyncResult>> syncWithOneTarget(List<TableChange> tableChanges) {
+    when(mockConversionTarget1.getTableFormat()).thenReturn(TableFormat.ICEBERG);
+    IncrementalTableChanges incrementalTableChanges =
+        IncrementalTableChanges.builder()
+            .pendingCommits(Collections.emptyList())
+            .tableChanges(tableChanges.iterator())
+            .build();
+    Map<ConversionTarget, TableSyncMetadata> metadata = new HashMap<>();
+    metadata.put(
+        mockConversionTarget1,
+        TableSyncMetadata.of(
+            Instant.now().minus(1, ChronoUnit.HOURS), Collections.emptyList(), "TEST", "0"));
+    return TableFormatSync.getInstance().syncChanges(metadata, incrementalTableChanges);
+  }
+
+  private static Set<String> paths(
+      Set<? extends org.apache.xtable.model.storage.InternalFile> files) {
+    Set<String> result = new HashSet<>();
+    files.forEach(f -> result.add(f.getPhysicalPath()));
+    return result;
+  }
+
+  @Test
+  void mergeOffKeepsOneSyncPerCommit() {
+    List<TableChange> tableChanges =
+        Arrays.asList(
+            change(sameLayoutState(1), "1", Arrays.asList("a"), Collections.emptyList()),
+            change(sameLayoutState(2), "2", Arrays.asList("b"), Collections.emptyList()));
+    Map<String, List<SyncResult>> result = syncWithOneTarget(tableChanges);
+    assertEquals(2, result.get(TableFormat.ICEBERG).size());
+    verify(mockConversionTarget1, times(2)).completeSync();
+    verify(mockConversionTarget1).syncFilesForDiff(tableChanges.get(0).getFilesDiff());
+    verify(mockConversionTarget1).syncFilesForDiff(tableChanges.get(1).getFilesDiff());
+  }
+
+  @Test
+  void mergeOnAppliesConsecutiveCommitsAsOneSync() {
+    System.setProperty(TableFormatSync.MERGE_COMMITS_PROPERTY, "true");
+    InternalTable last = sameLayoutState(3);
+    List<TableChange> tableChanges =
+        Arrays.asList(
+            change(sameLayoutState(1), "1", Arrays.asList("a", "b"), Collections.emptyList()),
+            change(sameLayoutState(2), "2", Arrays.asList("c"), Arrays.asList("old")),
+            change(last, "3", Arrays.asList("d"), Collections.emptyList()));
+
+    Map<String, List<SyncResult>> result = syncWithOneTarget(tableChanges);
+
+    assertEquals(1, result.get(TableFormat.ICEBERG).size());
+    assertEquals(
+        last.getLatestCommitTime(), result.get(TableFormat.ICEBERG).get(0).getLastInstantSynced());
+    verify(mockConversionTarget1, times(1)).completeSync();
+    verifyBaseConversionTargetCalls(mockConversionTarget1, last, Collections.emptyList(), "3");
+    ArgumentCaptor<InternalFilesDiff> diff = ArgumentCaptor.forClass(InternalFilesDiff.class);
+    verify(mockConversionTarget1).syncFilesForDiff(diff.capture());
+    assertEquals(
+        new HashSet<>(
+            Arrays.asList(
+                "/tmp/path/a.parquet",
+                "/tmp/path/b.parquet",
+                "/tmp/path/c.parquet",
+                "/tmp/path/d.parquet")),
+        paths(diff.getValue().getFilesAdded()));
+    assertEquals(
+        Collections.singleton("/tmp/path/old.parquet"), paths(diff.getValue().getFilesRemoved()));
+  }
+
+  @Test
+  void mergeOnDropsFilesAddedAndRemovedInsideTheRun() {
+    System.setProperty(TableFormatSync.MERGE_COMMITS_PROPERTY, "true");
+    List<TableChange> tableChanges =
+        Arrays.asList(
+            change(sameLayoutState(1), "1", Arrays.asList("a", "b"), Collections.emptyList()),
+            change(sameLayoutState(2), "2", Arrays.asList("c"), Arrays.asList("a")));
+
+    syncWithOneTarget(tableChanges);
+
+    ArgumentCaptor<InternalFilesDiff> diff = ArgumentCaptor.forClass(InternalFilesDiff.class);
+    verify(mockConversionTarget1).syncFilesForDiff(diff.capture());
+    assertEquals(
+        new HashSet<>(Arrays.asList("/tmp/path/b.parquet", "/tmp/path/c.parquet")),
+        paths(diff.getValue().getFilesAdded()));
+    assertTrue(diff.getValue().getFilesRemoved().isEmpty());
+  }
+
+  @Test
+  void mergeOnKeepsCommitsApartWhenAPathIsRemovedAndAddedAgain() {
+    System.setProperty(TableFormatSync.MERGE_COMMITS_PROPERTY, "true");
+    List<TableChange> tableChanges =
+        Arrays.asList(
+            change(sameLayoutState(1), "1", Collections.emptyList(), Arrays.asList("x")),
+            change(sameLayoutState(2), "2", Arrays.asList("x"), Collections.emptyList()));
+    assertNull(TableFormatSync.mergeFilesDiffs(tableChanges));
+
+    Map<String, List<SyncResult>> result = syncWithOneTarget(tableChanges);
+
+    assertEquals(2, result.get(TableFormat.ICEBERG).size());
+    verify(mockConversionTarget1).syncFilesForDiff(tableChanges.get(0).getFilesDiff());
+    verify(mockConversionTarget1).syncFilesForDiff(tableChanges.get(1).getFilesDiff());
+  }
+
+  @Test
+  void mergeOnSplitsRunsAtASchemaChange() {
+    System.setProperty(TableFormatSync.MERGE_COMMITS_PROPERTY, "true");
+    InternalTable newSchema = getTableState(5);
+    List<TableChange> tableChanges =
+        Arrays.asList(
+            change(sameLayoutState(1), "1", Arrays.asList("a"), Collections.emptyList()),
+            change(sameLayoutState(2), "2", Arrays.asList("b"), Collections.emptyList()),
+            change(newSchema, "3", Arrays.asList("c"), Collections.emptyList()));
+
+    Map<String, List<SyncResult>> result = syncWithOneTarget(tableChanges);
+
+    assertEquals(2, result.get(TableFormat.ICEBERG).size());
+    verify(mockConversionTarget1, times(2)).completeSync();
+    verify(mockConversionTarget1).syncSchema(newSchema.getReadSchema());
+  }
+
+  @Test
+  void mergeOnRespectsTheCommitCap() {
+    System.setProperty(TableFormatSync.MERGE_COMMITS_PROPERTY, "true");
+    System.setProperty(TableFormatSync.MAX_COMMITS_PER_SYNC_PROPERTY, "2");
+    List<TableChange> tableChanges =
+        Arrays.asList(
+            change(sameLayoutState(1), "1", Arrays.asList("a"), Collections.emptyList()),
+            change(sameLayoutState(2), "2", Arrays.asList("b"), Collections.emptyList()),
+            change(sameLayoutState(3), "3", Arrays.asList("c"), Collections.emptyList()),
+            change(sameLayoutState(4), "4", Arrays.asList("d"), Collections.emptyList()),
+            change(sameLayoutState(5), "5", Arrays.asList("e"), Collections.emptyList()));
+
+    Map<String, List<SyncResult>> result = syncWithOneTarget(tableChanges);
+
+    assertEquals(3, result.get(TableFormat.ICEBERG).size());
+    verify(mockConversionTarget1, times(3)).completeSync();
+  }
+
+  @Test
+  void mergeOnStopsLaterRunsForAFailingTarget() {
+    System.setProperty(TableFormatSync.MERGE_COMMITS_PROPERTY, "true");
+    System.setProperty(TableFormatSync.MAX_COMMITS_PER_SYNC_PROPERTY, "2");
+    InternalTable firstRunEnd = sameLayoutState(2);
+    doThrow(new RuntimeException("Failure")).when(mockConversionTarget1).beginSync(firstRunEnd);
+    List<TableChange> tableChanges =
+        Arrays.asList(
+            change(sameLayoutState(1), "1", Arrays.asList("a"), Collections.emptyList()),
+            change(firstRunEnd, "2", Arrays.asList("b"), Collections.emptyList()),
+            change(sameLayoutState(3), "3", Arrays.asList("c"), Collections.emptyList()));
+
+    Map<String, List<SyncResult>> result = syncWithOneTarget(tableChanges);
+
+    List<SyncResult> results = result.get(TableFormat.ICEBERG);
+    assertEquals(1, results.size());
+    assertEquals(SyncStatusCode.ERROR, results.get(0).getTableFormatSyncStatus().getStatusCode());
+    verify(mockConversionTarget1, never()).completeSync();
+    verify(mockConversionTarget1, times(1)).beginSync(any());
   }
 }
