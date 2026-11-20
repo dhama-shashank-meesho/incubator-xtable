@@ -300,6 +300,25 @@
             <version>${jol.core.version}</version>
             <scope>runtime</scope>
         </dependency>
+        <!--
+          HiveCatalog for Iceberg sources named <db>.<table>, which RunSync reads through HMS.
+          It is loaded reflectively by CatalogUtil and needs nothing that is not already bundled,
+          so no transitive dependencies are taken. Its metastore client (HiveMetaStoreClient) is in
+          hive-standalone-metastore, which already arrives transitively via xtable-hive-metastore
+          and is only added to the shaded artifactSet below.
+        -->
+        <dependency>
+            <groupId>org.apache.iceberg</groupId>
+            <artifactId>iceberg-hive-metastore</artifactId>
+            <version>${iceberg.version}</version>
+            <scope>runtime</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
     </dependencies>
 
     <build>
@@ -623,6 +642,7 @@
                             <include>org.apache.hive:hive-service</include>
                             <include>org.apache.hive:hive-service-rpc</include>
                             <include>org.apache.hive:hive-shims</include>
+                            <include>org.apache.hive:hive-standalone-metastore</include>
                             <include>org.apache.hive:hive-storage-api</include>
                             <include>org.apache.hive:hive-vector-code-gen</include>
                             <include>org.apache.htrace:htrace-core</include>
@@ -645,6 +665,7 @@
                             <include>org.apache.iceberg:iceberg-bundled-guava</include>
                             <include>org.apache.iceberg:iceberg-common</include>
                             <include>org.apache.iceberg:iceberg-core</include>
+                            <include>org.apache.iceberg:iceberg-hive-metastore</include>
                             <include>org.apache.iceberg:iceberg-parquet</include>
                             <include>org.apache.ivy:ivy</include>
                             <include>org.apache.kerby:kerb-core</include>

@@ -19,16 +19,20 @@
 package org.apache.xtable.utilities;
 
 import java.io.ByteArrayInputStream;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import lombok.Builder;
@@ -45,6 +49,14 @@ import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+
+import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.CatalogUtil;
+import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.TableIdentifier;
 
 import com.fasterxml.jackson.annotation.JsonMerge;
 import com.fasterxml.jackson.annotation.JsonProperty;
@@ -79,6 +91,18 @@ public class RunSync {
   private static final String CONTINUOUS_MODE = "m";
   private static final String CONTINUOUS_MODE_INTERVAL = "t";
   private static final String HELP_OPTION = "h";
+
+  /**
+   * An Iceberg source whose tableName is {@code <db>.<table>} and that has no
+   * --icebergCatalogConfig is read through this Hive metastore. HMS holds the table's current
+   * metadata pointer; {@code version-hint.text} is only moved by path-based writers, so a table
+   * that another engine (e.g. Fluss tiering) commits to through HMS would be read stale by path.
+   */
+  static final String HMS_URI_ENV = "XTABLE_HMS_URI";
+
+  static final String DEFAULT_HMS_URI = "thrift://dp-lb.hms.prd.meesho.int:9083";
+  static final String HIVE_CATALOG_IMPL = "org.apache.iceberg.hive.HiveCatalog";
+  private static final Pattern HMS_TABLE_NAME = Pattern.compile("(\\w+)\\.(\\w+)");
 
   private static final Options OPTIONS =
       new Options()
@@ -184,9 +208,19 @@ public class RunSync {
             HudiSourceConfig.PARTITION_FIELD_SPEC_CONFIG, table.getPartitionSpec());
       }
 
+      HmsSource hmsSource = resolveHmsSource(datasetConfig, table, catalogConfig, System.getenv());
       SourceTable sourceTable =
-          sourceTableBuilder(table, catalogConfig, datasetConfig, sourceProperties);
-      List<TargetTable> targetTables = targetTableBuilder(table, catalogConfig, tableFormatList);
+          hmsSource == null
+              ? sourceTableBuilder(table, catalogConfig, datasetConfig, sourceProperties)
+              : sourceTableBuilder(
+                  hmsSource.getTable(),
+                  hmsSource.getCatalogConfig(),
+                  datasetConfig,
+                  sourceProperties);
+      // Targets keep the given catalog config; only the source is read through HMS.
+      List<TargetTable> targetTables =
+          targetTableBuilder(
+              hmsSource == null ? table : hmsSource.getTable(), catalogConfig, tableFormatList);
       ConversionConfig conversionConfig =
           ConversionConfig.builder()
               .sourceTable(sourceTable)
@@ -194,11 +228,105 @@ public class RunSync {
               .syncMode(SyncMode.INCREMENTAL)
               .build();
       try {
+        if (hmsSource != null) {
+          checkHmsLocation(hmsSource, hadoopConf);
+        }
         conversionController.sync(conversionConfig, conversionSourceProvider);
       } catch (Exception e) {
         log.error("Error running sync for {}", table.getTableBasePath(), e);
       }
     }
+  }
+
+  /**
+   * Returns how to read an Iceberg source named {@code <db>.<table>} through HMS, or null when the
+   * table is read as before: a non-Iceberg source, an explicit --icebergCatalogConfig, or a name
+   * without a database.
+   */
+  @VisibleForTesting
+  static HmsSource resolveHmsSource(
+      DatasetConfig datasetConfig,
+      DatasetConfig.Table table,
+      CatalogConfig catalogConfig,
+      Map<String, String> env) {
+    if (!TableFormat.ICEBERG.equals(datasetConfig.getSourceFormat())
+        || catalogConfig != null
+        || table.getTableName() == null) {
+      return null;
+    }
+    Matcher matcher = HMS_TABLE_NAME.matcher(table.getTableName());
+    if (!matcher.matches()) {
+      return null;
+    }
+    String uri = env.getOrDefault(HMS_URI_ENV, DEFAULT_HMS_URI);
+    IcebergCatalogConfig hmsCatalog =
+        IcebergCatalogConfig.builder()
+            .catalogName("hms")
+            .catalogImpl(HIVE_CATALOG_IMPL)
+            .catalogOptions(Collections.singletonMap(CatalogProperties.URI, uri))
+            .build();
+    DatasetConfig.Table hmsTable =
+        DatasetConfig.Table.builder()
+            .tableBasePath(table.getTableBasePath())
+            .tableDataPath(table.getTableDataPath())
+            .tableName(matcher.group(2))
+            .namespace(matcher.group(1))
+            .partitionSpec(table.getPartitionSpec())
+            .build();
+    return new HmsSource(hmsTable, hmsCatalog);
+  }
+
+  /**
+   * Refuses the sync when HMS registers the table at a different location than tableBasePath, so a
+   * name mix-up can never convert another table into this folder. A failed HMS lookup also throws;
+   * there is deliberately no fallback to reading by path.
+   */
+  @VisibleForTesting
+  static void checkHmsLocation(HmsSource hmsSource, Configuration hadoopConf) {
+    IcebergCatalogConfig config = hmsSource.getCatalogConfig();
+    TableIdentifier identifier =
+        TableIdentifier.of(
+            hmsSource.getTable().getNamespace(), hmsSource.getTable().getTableName());
+    Catalog catalog =
+        CatalogUtil.loadCatalog(
+            config.getCatalogImpl(),
+            config.getCatalogName(),
+            config.getCatalogOptions(),
+            hadoopConf);
+    try {
+      Table icebergTable = catalog.loadTable(identifier);
+      checkLocation(identifier, icebergTable.location(), hmsSource.getTable().getTableBasePath());
+      log.info(
+          "Reading Iceberg source {} through HMS {} (metadata {})",
+          identifier,
+          config.getCatalogOptions().get(CatalogProperties.URI),
+          ((HasTableOperations) icebergTable).operations().current().metadataFileLocation());
+    } finally {
+      if (catalog instanceof Closeable) {
+        try {
+          ((Closeable) catalog).close();
+        } catch (IOException e) {
+          log.warn("Failed to close HMS catalog", e);
+        }
+      }
+    }
+  }
+
+  @VisibleForTesting
+  static void checkLocation(TableIdentifier identifier, String hmsLocation, String tableBasePath) {
+    // Compare as Hadoop paths: HMS may return file:///x for file:/x, or drop a trailing slash.
+    if (!new Path(hmsLocation).toUri().equals(new Path(tableBasePath).toUri())) {
+      throw new IllegalStateException(
+          String.format(
+              "HMS table %s is at %s, not at tableBasePath %s; refusing to sync",
+              identifier, hmsLocation, tableBasePath));
+    }
+  }
+
+  @Value
+  static class HmsSource {
+    DatasetConfig.Table table;
+    IcebergCatalogConfig catalogConfig;
   }
 
   static DatasetConfig getDatasetConfig(String datasetConfigPath) throws IOException {
