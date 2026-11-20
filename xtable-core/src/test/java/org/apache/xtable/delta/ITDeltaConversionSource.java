@@ -35,6 +35,7 @@ import static org.mockito.Mockito.verify;
 
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Instant;
@@ -501,6 +502,54 @@ public class ITDeltaConversionSource {
       allTableChanges.add(tableChange);
     }
     ValidationTestHelper.validateTableChanges(allActiveFiles, allTableChanges);
+  }
+
+  @Test
+  void dataFilePathsKeepSpacesInTheTableBasePath() throws Exception {
+    String tableName = GenericTable.getTableName();
+    Path basePath = tempDir.resolve(" dir with space").resolve(tableName);
+    sparkSession.sql(
+        "CREATE TABLE `"
+            + tableName
+            + "` USING DELTA PARTITIONED BY (part) LOCATION '"
+            + basePath
+            + "' AS SELECT * FROM VALUES (1, 'a b'), (2, 'c') AS t(id, part)");
+    sparkSession.sql("INSERT INTO `" + tableName + "` VALUES (3, 'a b'), (4, 'd')");
+    DeltaConversionSource conversionSource =
+        conversionSourceProvider.getConversionSourceInstance(
+            SourceTable.builder()
+                .name(tableName)
+                .basePath(basePath.toString())
+                .formatName(TableFormat.DELTA)
+                .build());
+
+    List<String> snapshotPaths =
+        conversionSource.getCurrentSnapshot().getPartitionedDataFiles().stream()
+            .flatMap(group -> group.getFiles().stream())
+            .map(file -> file.getPhysicalPath())
+            .collect(Collectors.toList());
+    Instant commit0Time =
+        Files.getLastModifiedTime(basePath.resolve("_delta_log/00000000000000000000.json"))
+            .toInstant();
+    CommitsBacklog<Long> backlog =
+        conversionSource.getCommitsBacklog(
+            InstantsForIncrementalSync.builder().lastSyncInstant(commit0Time).build());
+    assertEquals(Collections.singletonList(1L), backlog.getCommitsToProcess());
+    List<String> addedInCommit1 =
+        conversionSource.getTableChangeForCommit(1L).getFilesDiff().dataFilesAdded().stream()
+            .map(InternalDataFile::getPhysicalPath)
+            .collect(Collectors.toList());
+
+    assertEquals(4, snapshotPaths.size());
+    assertEquals(2, addedInCommit1.size());
+    Stream.concat(snapshotPaths.stream(), addedInCommit1.stream())
+        .forEach(
+            physicalPath -> {
+              assertTrue(physicalPath.contains("/ dir with space/"), physicalPath);
+              assertTrue(
+                  Files.exists(Paths.get(physicalPath.replaceFirst("^file:", ""))),
+                  "missing " + physicalPath);
+            });
   }
 
   @Test

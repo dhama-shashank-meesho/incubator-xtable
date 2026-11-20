@@ -21,6 +21,7 @@ package org.apache.xtable.delta;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -61,6 +62,7 @@ import org.apache.xtable.model.storage.InternalFilesDiff;
 import org.apache.xtable.model.storage.PartitionFileGroup;
 import org.apache.xtable.spi.extractor.ConversionSource;
 import org.apache.xtable.spi.extractor.DataFileIterator;
+import org.apache.xtable.spi.extractor.StreamedSnapshot;
 
 @Log4j2
 @Builder
@@ -112,9 +114,25 @@ public class DeltaConversionSource implements ConversionSource<Long> {
   }
 
   @Override
+  public Optional<StreamedSnapshot> getCurrentSnapshotStreamed() {
+    Snapshot snapshot = deltaLog.snapshot();
+    InternalTable table = tableExtractor.table(snapshot, tableName);
+    return Optional.of(
+        StreamedSnapshot.builder()
+            .snapshot(
+                InternalSnapshot.builder()
+                    .table(table)
+                    .partitionedDataFiles(Collections.emptyList())
+                    .sourceIdentifier(getCommitIdentifier(snapshot.version()))
+                    .build())
+            .files(dataFileExtractor.iterator(snapshot, table.getReadSchema()))
+            .build());
+  }
+
+  @Override
   public TableChange getTableChangeForCommit(Long versionNumber) {
     List<Action> actionsForVersion = getChangesState().getActionsForVersion(versionNumber);
-    String tableBasePath = deltaLog.dataPath().toUri().toString();
+    String tableBasePath = deltaLog.dataPath().toString();
     InternalTable tableAtVersion;
     FileFormat fileFormat;
     if (reuseMetadataAcrossCommits) {

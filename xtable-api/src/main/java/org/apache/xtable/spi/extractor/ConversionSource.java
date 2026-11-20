@@ -20,6 +20,7 @@ package org.apache.xtable.spi.extractor;
 
 import java.io.Closeable;
 import java.time.Instant;
+import java.util.Optional;
 
 import org.apache.xtable.annotations.Evolving;
 import org.apache.xtable.model.CommitsBacklog;
@@ -58,6 +59,17 @@ public interface ConversionSource<COMMIT> extends Closeable {
    * @return {@link InternalSnapshot} representing the current snapshot.
    */
   InternalSnapshot getCurrentSnapshot();
+
+  /**
+   * Extracts the current snapshot like {@link #getCurrentSnapshot()}, but leaves its data files to
+   * be read through an iterator instead of loading them all. Sources that cannot do this return
+   * empty, and callers use {@link #getCurrentSnapshot()} instead.
+   *
+   * @return the current snapshot and an iterator over its data files, or empty
+   */
+  default Optional<StreamedSnapshot> getCurrentSnapshotStreamed() {
+    return Optional.empty();
+  }
 
   /**
    * Extracts a {@link TableChange} for the provided commit.

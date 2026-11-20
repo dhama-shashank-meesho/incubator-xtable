@@ -1087,6 +1087,39 @@ public class ITConversionController {
     }
   }
 
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  public void testDeltaToIcebergFullSyncWithStreamedFiles(boolean isPartitioned) {
+    String tableName = getTableName();
+    List<String> targetTableFormats = Collections.singletonList(ICEBERG);
+    ConversionSourceProvider<?> conversionSourceProvider = getConversionSourceProvider(DELTA);
+    System.setProperty("xtable.snapshot.streamFiles", "true");
+    try (GenericTable table =
+        GenericTable.getInstance(tableName, tempDir, sparkSession, jsc, DELTA, isPartitioned)) {
+      List<?> insertRecords = table.insertRows(100);
+      table.insertRows(100);
+      table.upsertRows(insertRecords.subList(0, 20));
+      ConversionConfig conversionConfig =
+          getTableSyncConfig(
+              DELTA,
+              SyncMode.FULL,
+              tableName,
+              table,
+              targetTableFormats,
+              isPartitioned ? "level:VALUE" : null,
+              null);
+      conversionController.sync(conversionConfig, conversionSourceProvider);
+      checkDatasetEquivalence(DELTA, table, targetTableFormats, 200);
+
+      // the target now has files, so this full sync compares the snapshot with them
+      table.deleteRows(insertRecords.subList(30, 50));
+      conversionController.sync(conversionConfig, conversionSourceProvider);
+      checkDatasetEquivalence(DELTA, table, targetTableFormats, 180);
+    } finally {
+      System.clearProperty("xtable.snapshot.streamFiles");
+    }
+  }
+
   private Map<String, String> getTimeTravelOption(String tableFormat, Instant time) {
     Map<String, String> options = new HashMap<>();
     switch (tableFormat) {

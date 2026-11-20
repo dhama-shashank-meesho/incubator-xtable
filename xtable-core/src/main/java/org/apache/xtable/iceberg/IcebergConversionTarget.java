@@ -23,6 +23,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -60,6 +61,7 @@ import org.apache.xtable.model.InternalTable;
 import org.apache.xtable.model.metadata.TableSyncMetadata;
 import org.apache.xtable.model.schema.InternalPartitionField;
 import org.apache.xtable.model.schema.InternalSchema;
+import org.apache.xtable.model.storage.InternalDataFile;
 import org.apache.xtable.model.storage.InternalFilesDiff;
 import org.apache.xtable.model.storage.PartitionFileGroup;
 import org.apache.xtable.model.storage.TableFormat;
@@ -291,6 +293,21 @@ public class IcebergConversionTarget implements ConversionTarget {
         transaction.table().schema(),
         transaction.table().spec(),
         tableSyncMetadata);
+  }
+
+  @Override
+  public void streamFilesForSnapshot(Iterator<InternalDataFile> files) {
+    boolean appended =
+        dataFileUpdatesExtractor.appendSnapshotInManifestBatches(
+            table,
+            transaction,
+            files,
+            transaction.table().schema(),
+            transaction.table().spec(),
+            tableSyncMetadata);
+    if (!appended) {
+      ConversionTarget.super.streamFilesForSnapshot(files);
+    }
   }
 
   @Override

@@ -19,6 +19,7 @@
 package org.apache.xtable.spi.extractor;
 
 import java.util.Iterator;
+import java.util.Optional;
 
 import lombok.AllArgsConstructor;
 import lombok.Getter;
@@ -38,6 +39,10 @@ public class ExtractFromSource<COMMIT> {
 
   public InternalSnapshot extractSnapshot() {
     return conversionSource.getCurrentSnapshot();
+  }
+
+  public Optional<StreamedSnapshot> extractSnapshotStreamed() {
+    return conversionSource.getCurrentSnapshotStreamed();
   }
 
   public IncrementalTableChanges extractTableChanges(

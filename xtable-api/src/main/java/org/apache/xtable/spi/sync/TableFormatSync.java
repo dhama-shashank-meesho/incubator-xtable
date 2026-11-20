@@ -22,6 +22,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -48,6 +49,7 @@ import org.apache.xtable.model.sync.ErrorDetails;
 import org.apache.xtable.model.sync.SyncMode;
 import org.apache.xtable.model.sync.SyncResult;
 import org.apache.xtable.model.sync.SyncStatusCode;
+import org.apache.xtable.spi.extractor.StreamedSnapshot;
 
 /** Provides the functionality to sync from the InternalTable format to the target format. */
 @Log4j2
@@ -102,6 +104,36 @@ public class TableFormatSync {
       }
     }
     return results;
+  }
+
+  /**
+   * Syncs a snapshot whose data files are read through an iterator to a single target. The iterator
+   * can be read only once, so only one target can be synced this way.
+   *
+   * @param conversionTarget the target to sync with the snapshot
+   * @param streamed the snapshot and an iterator over its data files
+   * @return the result of the sync process
+   */
+  public Map<String, SyncResult> syncSnapshot(
+      ConversionTarget conversionTarget, StreamedSnapshot streamed) {
+    Instant startTime = Instant.now();
+    InternalSnapshot snapshot = streamed.getSnapshot();
+    SyncResult result;
+    try {
+      result =
+          getSyncResult(
+              conversionTarget,
+              SyncMode.FULL,
+              snapshot.getTable(),
+              target -> target.streamFilesForSnapshot(streamed.getFiles()),
+              startTime,
+              snapshot.getPendingCommits(),
+              snapshot.getSourceIdentifier());
+    } catch (Exception e) {
+      log.error("Failed to sync snapshot", e);
+      result = buildResultForError(SyncMode.FULL, startTime, e);
+    }
+    return Collections.singletonMap(conversionTarget.getTableFormat(), result);
   }
 
   /**
