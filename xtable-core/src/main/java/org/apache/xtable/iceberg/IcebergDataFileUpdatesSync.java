@@ -21,6 +21,7 @@ package org.apache.xtable.iceberg;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -102,6 +103,35 @@ public class IcebergDataFileUpdatesSync {
         transaction, diff.getFilesAdded(), diff.getFilesRemoved(), schema, partitionSpec, metadata);
   }
 
+  /**
+   * Writes the files of a full snapshot into manifests of {@code manifestBatchSize} files as they
+   * are read, without holding them all. This needs manifest batching to be on and the table to have
+   * no data files yet: there is then nothing to compare the snapshot with, and every file is added.
+   *
+   * @return false, with no file read and nothing written, when this is not possible
+   */
+  public boolean appendSnapshotInManifestBatches(
+      Table table,
+      Transaction transaction,
+      Iterator<? extends InternalFile> files,
+      Schema schema,
+      PartitionSpec partitionSpec,
+      TableSyncMetadata metadata) {
+    if (manifestBatchSize <= 0 || hasDataFiles(table)) {
+      return false;
+    }
+    appendInManifestBatches(transaction, files, schema, partitionSpec, metadata);
+    return true;
+  }
+
+  private static boolean hasDataFiles(Table table) {
+    try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+      return tasks.iterator().hasNext();
+    } catch (IOException e) {
+      throw new ReadException("Failed to iterate through Iceberg data files", e);
+    }
+  }
+
   public void applyDiff(
       Transaction transaction,
       InternalFilesDiff internalFilesDiff,
@@ -131,7 +161,7 @@ public class IcebergDataFileUpdatesSync {
       PartitionSpec partitionSpec,
       TableSyncMetadata metadata) {
     if (manifestBatchSize > 0 && filesRemoved.isEmpty()) {
-      appendInManifestBatches(transaction, filesAdded, schema, partitionSpec, metadata);
+      appendInManifestBatches(transaction, filesAdded.iterator(), schema, partitionSpec, metadata);
       return;
     }
     OverwriteFiles overwriteFiles = transaction.newOverwrite();
@@ -150,7 +180,7 @@ public class IcebergDataFileUpdatesSync {
    */
   private void appendInManifestBatches(
       Transaction transaction,
-      Collection<? extends InternalFile> filesAdded,
+      Iterator<? extends InternalFile> filesAdded,
       Schema schema,
       PartitionSpec partitionSpec,
       TableSyncMetadata metadata) {
@@ -162,7 +192,8 @@ public class IcebergDataFileUpdatesSync {
     int manifestCount = 0;
     int filesInManifest = 0;
     try {
-      for (InternalFile file : filesAdded) {
+      while (filesAdded.hasNext()) {
+        InternalFile file = filesAdded.next();
         if (!(file instanceof InternalDataFile)) {
           continue;
         }

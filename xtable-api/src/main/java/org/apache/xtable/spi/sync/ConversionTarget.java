@@ -18,6 +18,8 @@
  
 package org.apache.xtable.spi.sync;
 
+import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 
@@ -29,6 +31,7 @@ import org.apache.xtable.model.InternalTable;
 import org.apache.xtable.model.metadata.TableSyncMetadata;
 import org.apache.xtable.model.schema.InternalPartitionField;
 import org.apache.xtable.model.schema.InternalSchema;
+import org.apache.xtable.model.storage.InternalDataFile;
 import org.apache.xtable.model.storage.InternalFilesDiff;
 import org.apache.xtable.model.storage.PartitionFileGroup;
 
@@ -65,6 +68,19 @@ public interface ConversionTarget {
    * @param partitionedDataFiles the files to sync, grouped by partition
    */
   void syncFilesForSnapshot(List<PartitionFileGroup> partitionedDataFiles);
+
+  /**
+   * Syncs the files of a full snapshot that are read one at a time, for tables too large to hold
+   * every file in memory. Targets that cannot write files this way collect them and call {@link
+   * #syncFilesForSnapshot(List)}.
+   *
+   * @param files the files to sync; read once
+   */
+  default void streamFilesForSnapshot(Iterator<InternalDataFile> files) {
+    List<InternalDataFile> dataFiles = new ArrayList<>();
+    files.forEachRemaining(dataFiles::add);
+    syncFilesForSnapshot(PartitionFileGroup.fromFiles(dataFiles));
+  }
 
   /**
    * Syncs the changes in files to the target system. This method is required to both add and remove

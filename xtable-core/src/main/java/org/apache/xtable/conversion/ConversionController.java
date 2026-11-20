@@ -52,7 +52,9 @@ import org.apache.xtable.model.sync.SyncMode;
 import org.apache.xtable.model.sync.SyncResult;
 import org.apache.xtable.model.sync.SyncStatusCode;
 import org.apache.xtable.spi.extractor.ConversionSource;
+import org.apache.xtable.spi.extractor.DataFileIterator;
 import org.apache.xtable.spi.extractor.ExtractFromSource;
+import org.apache.xtable.spi.extractor.StreamedSnapshot;
 import org.apache.xtable.spi.sync.CatalogSync;
 import org.apache.xtable.spi.sync.CatalogSyncClient;
 import org.apache.xtable.spi.sync.ConversionTarget;
@@ -71,6 +73,10 @@ import org.apache.xtable.spi.sync.TableFormatSync;
 @Log4j2
 @RequiredArgsConstructor(access = AccessLevel.PACKAGE)
 public class ConversionController {
+  // When true, a full sync to a single target reads the source's data files through an iterator
+  // instead of loading them all first, if the source supports it. Off by default.
+  static final String STREAM_FILES_PROPERTY = "xtable.snapshot.streamFiles";
+
   private final Configuration conf;
   private final ConversionTargetFactory conversionTargetFactory;
   private final CatalogConversionFactory catalogConversionFactory;
@@ -286,9 +292,28 @@ public class ConversionController {
 
   private <COMMIT> SyncResultForTableFormats syncSnapshot(
       Map<String, ConversionTarget> conversionTargetByFormat, ExtractFromSource<COMMIT> source) {
+    if (Boolean.getBoolean(STREAM_FILES_PROPERTY) && conversionTargetByFormat.size() == 1) {
+      Optional<StreamedSnapshot> streamed = source.extractSnapshotStreamed();
+      if (streamed.isPresent()) {
+        return syncStreamedSnapshot(
+            conversionTargetByFormat.values().iterator().next(), streamed.get());
+      }
+    }
     InternalSnapshot snapshot = source.extractSnapshot();
     Map<String, SyncResult> syncResultsByFormat =
         tableFormatSync.syncSnapshot(conversionTargetByFormat.values(), snapshot);
+    return SyncResultForTableFormats.builder().lastSyncResult(syncResultsByFormat).build();
+  }
+
+  private SyncResultForTableFormats syncStreamedSnapshot(
+      ConversionTarget conversionTarget, StreamedSnapshot streamed) {
+    log.info("Syncing the snapshot with its data files streamed ({})", STREAM_FILES_PROPERTY);
+    Map<String, SyncResult> syncResultsByFormat;
+    try (DataFileIterator files = streamed.getFiles()) {
+      syncResultsByFormat = tableFormatSync.syncSnapshot(conversionTarget, streamed);
+    } catch (Exception e) {
+      throw new ReadException("Failed to close the data file iterator", e);
+    }
     return SyncResultForTableFormats.builder().lastSyncResult(syncResultsByFormat).build();
   }
 

@@ -44,6 +44,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -106,6 +107,8 @@ import org.apache.xtable.model.storage.PartitionFileGroup;
 import org.apache.xtable.model.storage.TableFormat;
 import org.apache.xtable.model.sync.SyncResult;
 import org.apache.xtable.schema.SchemaFieldFinder;
+import org.apache.xtable.spi.extractor.DataFileIterator;
+import org.apache.xtable.spi.extractor.StreamedSnapshot;
 import org.apache.xtable.spi.sync.TableFormatSync;
 
 /**
@@ -805,6 +808,115 @@ public class TestIcebergSync {
     assertEquals(
         Optional.of(String.valueOf(getTable(basePath).currentSnapshot().snapshotId())),
         conversionTarget.getTargetCommitIdentifier("1"));
+  }
+
+  @Test
+  public void testStreamedSnapshotFilesWrittenInManifestBatches() throws Exception {
+    conversionTarget =
+        getConversionTarget(
+            new IcebergDataFileUpdatesSync(
+                mockColumnStatsConverter, IcebergPartitionValueConverter.getInstance(), 2));
+    InternalPartitionField partitionField =
+        InternalPartitionField.builder()
+            .sourceField(
+                SchemaFieldFinder.getInstance().findFieldByPath(internalSchema, "group_id"))
+            .transformType(PartitionTransformType.VALUE)
+            .build();
+    InternalTable table =
+        getInternalTable(
+            tableName,
+            basePath,
+            internalSchema,
+            Collections.singletonList(partitionField),
+            LAST_COMMIT_TIME);
+    List<PartitionValue> partitionValues1 =
+        Collections.singletonList(
+            PartitionValue.builder().partitionField(partitionField).range(Range.scalar(1)).build());
+    List<PartitionValue> partitionValues2 =
+        Collections.singletonList(
+            PartitionValue.builder().partitionField(partitionField).range(Range.scalar(2)).build());
+    InternalDataFile dataFile1 = getDataFile(1, partitionValues1);
+    InternalDataFile dataFile2 = getDataFile(2, partitionValues1);
+    InternalDataFile dataFile3 = getDataFile(3, partitionValues2);
+    InternalDataFile dataFile4 = getDataFile(4, partitionValues2);
+
+    when(mockSchemaExtractor.toIceberg(internalSchema)).thenReturn(icebergSchema);
+    PartitionSpec partitionSpec =
+        PartitionSpec.builderFor(icebergSchema)
+            .identity(partitionField.getSourceField().getName())
+            .build();
+    when(mockPartitionSpecExtractor.toIceberg(
+            eq(Collections.singletonList(partitionField)), any(Schema.class)))
+        .thenReturn(partitionSpec);
+    mockColStatsForFile(dataFile1, 1);
+    mockColStatsForFile(dataFile2, 1);
+    mockColStatsForFile(dataFile3, 1);
+    mockColStatsForFile(dataFile4, 1);
+
+    // the table is empty, so the files go straight into manifests of 2 files each
+    Map<String, SyncResult> result1 =
+        TableFormatSync.getInstance()
+            .syncSnapshot(
+                conversionTarget, streamedSnapshot(table, "0", dataFile1, dataFile2, dataFile3));
+    assertEquals(
+        SyncResult.SyncStatus.SUCCESS, result1.get(TableFormat.ICEBERG).getTableFormatSyncStatus());
+    Table icebergTable = getTable(basePath);
+    assertEquals(2, icebergTable.currentSnapshot().allManifests(icebergTable.io()).size());
+    assertEquals(
+        "3", icebergTable.currentSnapshot().summary().get(SnapshotSummary.ADDED_FILES_PROP));
+    assertEquals(
+        Optional.of(String.valueOf(icebergTable.currentSnapshot().snapshotId())),
+        conversionTarget.getTargetCommitIdentifier("0"));
+    validateIcebergTable(
+        tableName,
+        table,
+        Sets.newHashSet(dataFile1, dataFile2),
+        Expressions.equal(partitionField.getSourceField().getName(), 1),
+        icebergSchema);
+    validateIcebergTable(
+        tableName,
+        table,
+        Sets.newHashSet(dataFile3),
+        Expressions.equal(partitionField.getSourceField().getName(), 2),
+        icebergSchema);
+
+    // the table now has files, so the snapshot is compared with them and dataFile1 is removed
+    TableFormatSync.getInstance()
+        .syncSnapshot(
+            conversionTarget, streamedSnapshot(table, "1", dataFile2, dataFile3, dataFile4));
+    validateIcebergTable(
+        tableName, table, Sets.newHashSet(dataFile2, dataFile3, dataFile4), null, icebergSchema);
+    assertEquals(
+        Optional.of(String.valueOf(getTable(basePath).currentSnapshot().snapshotId())),
+        conversionTarget.getTargetCommitIdentifier("1"));
+  }
+
+  private static StreamedSnapshot streamedSnapshot(
+      InternalTable table, String sourceIdentifier, InternalDataFile... dataFiles) {
+    Iterator<InternalDataFile> files = Arrays.asList(dataFiles).iterator();
+    return StreamedSnapshot.builder()
+        .snapshot(
+            InternalSnapshot.builder()
+                .table(table)
+                .partitionedDataFiles(Collections.emptyList())
+                .sourceIdentifier(sourceIdentifier)
+                .build())
+        .files(
+            new DataFileIterator() {
+              @Override
+              public boolean hasNext() {
+                return files.hasNext();
+              }
+
+              @Override
+              public InternalDataFile next() {
+                return files.next();
+              }
+
+              @Override
+              public void close() {}
+            })
+        .build();
   }
 
   @Test
