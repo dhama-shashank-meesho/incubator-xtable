@@ -24,8 +24,11 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -39,6 +42,8 @@ import org.apache.xtable.model.InternalSnapshot;
 import org.apache.xtable.model.InternalTable;
 import org.apache.xtable.model.TableChange;
 import org.apache.xtable.model.metadata.TableSyncMetadata;
+import org.apache.xtable.model.storage.InternalFile;
+import org.apache.xtable.model.storage.InternalFilesDiff;
 import org.apache.xtable.model.sync.ErrorDetails;
 import org.apache.xtable.model.sync.SyncMode;
 import org.apache.xtable.model.sync.SyncResult;
@@ -49,6 +54,17 @@ import org.apache.xtable.model.sync.SyncStatusCode;
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
 public class TableFormatSync {
   private static final TableFormatSync INSTANCE = new TableFormatSync();
+
+  /**
+   * When true, consecutive incremental changes with the same schema and partitioning are applied to
+   * a target as one sync (one target commit) instead of one sync per source commit.
+   */
+  static final String MERGE_COMMITS_PROPERTY = "xtable.incremental.mergeCommits";
+
+  /** Most source commits applied in one merged sync. */
+  static final String MAX_COMMITS_PER_SYNC_PROPERTY = "xtable.incremental.maxCommitsPerSync";
+
+  private static final int DEFAULT_MAX_COMMITS_PER_SYNC = 100;
 
   public static TableFormatSync getInstance() {
     return INSTANCE;
@@ -99,6 +115,9 @@ public class TableFormatSync {
   public Map<String, List<SyncResult>> syncChanges(
       Map<ConversionTarget, TableSyncMetadata> conversionTargetWithMetadata,
       IncrementalTableChanges changes) {
+    if (Boolean.getBoolean(MERGE_COMMITS_PROPERTY)) {
+      return syncMergedChanges(conversionTargetWithMetadata, changes);
+    }
     Map<String, List<SyncResult>> results = new HashMap<>();
     Set<ConversionTarget> conversionTargetsWithFailures = new HashSet<>();
     while (changes.getTableChanges().hasNext()) {
@@ -137,6 +156,161 @@ public class TableFormatSync {
       }
     }
     return results;
+  }
+
+  /**
+   * Same as the per-commit path, but runs of consecutive changes that have the same schema,
+   * partitioning and target set are applied as one sync. The files diff of a run is the net change
+   * over its commits, and the run's last change supplies the table state and source identifier, so
+   * the sync metadata ends at the same place as with per-commit syncs.
+   */
+  private Map<String, List<SyncResult>> syncMergedChanges(
+      Map<ConversionTarget, TableSyncMetadata> conversionTargetWithMetadata,
+      IncrementalTableChanges changes) {
+    int maxCommitsPerSync =
+        Math.max(
+            1, Integer.getInteger(MAX_COMMITS_PER_SYNC_PROPERTY, DEFAULT_MAX_COMMITS_PER_SYNC));
+    Map<String, List<SyncResult>> results = new HashMap<>();
+    Set<ConversionTarget> conversionTargetsWithFailures = new HashSet<>();
+    List<TableChange> group = new ArrayList<>();
+    Set<ConversionTarget> groupTargets = new LinkedHashSet<>();
+    while (changes.getTableChanges().hasNext()) {
+      TableChange change = changes.getTableChanges().next();
+      Set<ConversionTarget> targets = applicableTargets(conversionTargetWithMetadata, change);
+      if (!group.isEmpty()
+          && (group.size() >= maxCommitsPerSync
+              || !targets.equals(groupTargets)
+              || !sameLayout(group.get(group.size() - 1), change))) {
+        syncGroup(group, groupTargets, changes, results, conversionTargetsWithFailures);
+        group = new ArrayList<>();
+      }
+      if (group.isEmpty()) {
+        groupTargets = targets;
+      }
+      group.add(change);
+    }
+    if (!group.isEmpty()) {
+      syncGroup(group, groupTargets, changes, results, conversionTargetsWithFailures);
+    }
+    return results;
+  }
+
+  private void syncGroup(
+      List<TableChange> group,
+      Set<ConversionTarget> targets,
+      IncrementalTableChanges changes,
+      Map<String, List<SyncResult>> results,
+      Set<ConversionTarget> conversionTargetsWithFailures) {
+    InternalFilesDiff mergedDiff = mergeFilesDiffs(group);
+    if (mergedDiff == null) {
+      // A path was removed and added again inside the run; keep the commits apart.
+      for (TableChange change : group) {
+        syncChangeToTargets(
+            change,
+            change.getFilesDiff(),
+            targets,
+            changes,
+            results,
+            conversionTargetsWithFailures);
+      }
+      return;
+    }
+    TableChange last = group.get(group.size() - 1);
+    if (group.size() > 1) {
+      log.info(
+          "Merged {} source commits ({} to {}) into one sync",
+          group.size(),
+          group.get(0).getSourceIdentifier(),
+          last.getSourceIdentifier());
+    }
+    syncChangeToTargets(last, mergedDiff, targets, changes, results, conversionTargetsWithFailures);
+  }
+
+  private void syncChangeToTargets(
+      TableChange change,
+      InternalFilesDiff filesDiff,
+      Set<ConversionTarget> targets,
+      IncrementalTableChanges changes,
+      Map<String, List<SyncResult>> results,
+      Set<ConversionTarget> conversionTargetsWithFailures) {
+    for (ConversionTarget conversionTarget : targets) {
+      if (conversionTargetsWithFailures.contains(conversionTarget)) {
+        continue;
+      }
+      Instant startTime = Instant.now();
+      List<SyncResult> resultsForFormat =
+          results.computeIfAbsent(conversionTarget.getTableFormat(), key -> new ArrayList<>());
+      try {
+        resultsForFormat.add(
+            getSyncResult(
+                conversionTarget,
+                SyncMode.INCREMENTAL,
+                change.getTableAsOfChange(),
+                target -> target.syncFilesForDiff(filesDiff),
+                startTime,
+                changes.getPendingCommits(),
+                change.getSourceIdentifier()));
+      } catch (Exception e) {
+        log.error("Failed to sync table changes", e);
+        resultsForFormat.add(buildResultForError(SyncMode.INCREMENTAL, startTime, e));
+        conversionTargetsWithFailures.add(conversionTarget);
+      }
+    }
+  }
+
+  private static Set<ConversionTarget> applicableTargets(
+      Map<ConversionTarget, TableSyncMetadata> conversionTargetWithMetadata, TableChange change) {
+    Set<ConversionTarget> targets = new LinkedHashSet<>();
+    for (Map.Entry<ConversionTarget, TableSyncMetadata> entry :
+        conversionTargetWithMetadata.entrySet()) {
+      if (isChangeApplicableForLastSyncMetadata(change, entry.getValue())) {
+        targets.add(entry.getKey());
+      }
+    }
+    return targets;
+  }
+
+  private static boolean sameLayout(TableChange previous, TableChange next) {
+    InternalTable a = previous.getTableAsOfChange();
+    InternalTable b = next.getTableAsOfChange();
+    return Objects.equals(a.getReadSchema(), b.getReadSchema())
+        && Objects.equals(a.getPartitioningFields(), b.getPartitioningFields());
+  }
+
+  /**
+   * Net files diff over a run of changes, matching files by physical path. A file added and later
+   * removed inside the run is left out of both sets. Returns null when a path is removed and then
+   * added again, which the run cannot express as one diff.
+   */
+  static InternalFilesDiff mergeFilesDiffs(List<TableChange> group) {
+    if (group.size() == 1) {
+      return group.get(0).getFilesDiff();
+    }
+    Map<String, InternalFile> added = new LinkedHashMap<>();
+    Map<String, InternalFile> removed = new LinkedHashMap<>();
+    for (TableChange change : group) {
+      InternalFilesDiff diff = change.getFilesDiff();
+      if (diff == null) {
+        continue;
+      }
+      for (InternalFile file : diff.getFilesRemoved()) {
+        String path = file.getPhysicalPath();
+        if (added.remove(path) == null) {
+          removed.put(path, file);
+        }
+      }
+      for (InternalFile file : diff.getFilesAdded()) {
+        String path = file.getPhysicalPath();
+        if (removed.containsKey(path)) {
+          return null;
+        }
+        added.put(path, file);
+      }
+    }
+    return InternalFilesDiff.builder()
+        .filesAdded(added.values())
+        .filesRemoved(removed.values())
+        .build();
   }
 
   private static boolean isChangeApplicableForLastSyncMetadata(
