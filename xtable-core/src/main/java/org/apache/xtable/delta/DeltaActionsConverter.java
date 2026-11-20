@@ -363,8 +363,10 @@ public class DeltaActionsConverter {
     return DeltaPathUtils.getFullPathToFile(tableBasePath(snapshot), dataFilePath);
   }
 
+  // Path.toString, not toUri().toString: the URI form escapes characters such as a space to %20,
+  // and data file paths built on it would name objects that do not exist.
   private static String tableBasePath(Snapshot snapshot) {
-    return snapshot.deltaLog().dataPath().toUri().toString();
+    return snapshot.deltaLog().dataPath().toString();
   }
 
   /**

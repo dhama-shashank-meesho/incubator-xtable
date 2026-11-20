@@ -78,6 +78,22 @@ class TestDeltaActionsConverter {
   }
 
   @Test
+  void fullPathKeepsSpacesInTheTableBasePath() {
+    Snapshot snapshot = Mockito.mock(Snapshot.class);
+    DeltaLog deltaLog = Mockito.mock(DeltaLog.class);
+    Mockito.when(snapshot.deltaLog()).thenReturn(deltaLog);
+    Mockito.when(deltaLog.dataPath()).thenReturn(new Path("gs://bucket/SILVER/ db/table"));
+
+    Assertions.assertEquals(
+        "gs://bucket/SILVER/ db/table/year=2025/part-0.parquet",
+        DeltaActionsConverter.getFullPathToFile(snapshot, "year=2025/part-0.parquet"));
+    // a relative path is URI-encoded in the Delta log
+    Assertions.assertEquals(
+        "gs://bucket/SILVER/ db/table/city=New York/part-0.parquet",
+        DeltaActionsConverter.getFullPathToFile(snapshot, "city=New%20York/part-0.parquet"));
+  }
+
+  @Test
   void convertAddActionsPreservesOrder() {
     DeltaStatsExtractor statsExtractor = Mockito.mock(DeltaStatsExtractor.class);
     Mockito.when(statsExtractor.getColumnStatsForFile(any(), anyString(), any()))

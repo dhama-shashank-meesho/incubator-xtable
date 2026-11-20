@@ -114,7 +114,7 @@ public class DeltaConversionSource implements ConversionSource<Long> {
   @Override
   public TableChange getTableChangeForCommit(Long versionNumber) {
     List<Action> actionsForVersion = getChangesState().getActionsForVersion(versionNumber);
-    String tableBasePath = deltaLog.dataPath().toUri().toString();
+    String tableBasePath = deltaLog.dataPath().toString();
     InternalTable tableAtVersion;
     FileFormat fileFormat;
     if (reuseMetadataAcrossCommits) {
